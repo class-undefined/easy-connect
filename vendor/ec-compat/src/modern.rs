@@ -919,11 +919,16 @@ mod tests {
         );
         let socket = SockRef::from(&stream);
         assert!(socket.keepalive().unwrap());
-        assert_eq!(socket.tcp_keepalive_time().unwrap(), GATEWAY_KEEPALIVE_IDLE);
-        assert_eq!(
-            socket.tcp_keepalive_interval().unwrap(),
-            GATEWAY_KEEPALIVE_INTERVAL
-        );
+        // Windows can set these options but socket2 exposes their getters only
+        // on Unix. Keep the common socket behavior checks on every platform.
+        #[cfg(unix)]
+        {
+            assert_eq!(socket.tcp_keepalive_time().unwrap(), GATEWAY_KEEPALIVE_IDLE);
+            assert_eq!(
+                socket.tcp_keepalive_interval().unwrap(),
+                GATEWAY_KEEPALIVE_INTERVAL
+            );
+        }
         assert_eq!(
             socket.tcp_keepalive_retries().unwrap(),
             GATEWAY_KEEPALIVE_RETRIES
