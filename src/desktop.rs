@@ -7,7 +7,8 @@ use gpui::{
     size,
 };
 use gpui_component::{
-    Root, Sizable, Theme, ThemeMode,
+    Disableable, Root, Sizable, Theme, ThemeMode,
+    button::{Button, ButtonVariants},
     input::{Input, InputState},
 };
 use serde::{Deserialize, Serialize};
@@ -16,10 +17,7 @@ use sha2::{Digest, Sha256};
 use std::process::Command;
 use std::{
     path::PathBuf,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tray_icon::{
@@ -28,8 +26,10 @@ use tray_icon::{
 };
 use zeroize::Zeroizing;
 
+mod controller;
 mod password;
 mod updates;
+use controller::{Controller, Live, Readiness};
 use updates::UpdateState;
 const AUTHOR: &str = "野漫横江";
 gpui::actions!(
@@ -64,6 +64,7 @@ struct Preferences {
     gateway: String,
     username: String,
     remember: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     cert_sha256: String,
     #[serde(default = "enabled")]
     auto_login: bool,
@@ -189,94 +190,52 @@ fn install_service() -> Result<()> {
         let arguments = wide(std::ffi::OsStr::new(&format!(
             "install-service --owner {owner}"
         )));
-        // SAFETY: all UTF-16 buffers are NUL-terminated and live for the complete call.
-        let result = unsafe {
-            windows_sys::Win32::UI::Shell::ShellExecuteW(
-                std::ptr::null_mut(),
-                operation.as_ptr(),
-                file.as_ptr(),
-                arguments.as_ptr(),
-                std::ptr::null(),
-                1,
-            )
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, WAIT_OBJECT_0},
+            System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject},
+            UI::Shell::{
+                SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+            },
         };
-        if result as usize <= 32 {
-            bail!("安装程序未启动或管理员授权被取消");
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+            lpVerb: operation.as_ptr(),
+            lpFile: file.as_ptr(),
+            lpParameters: arguments.as_ptr(),
+            nShow: 0,
+            ..Default::default()
+        };
+        // SAFETY: all UTF-16 buffers live for this call, and cbSize matches info.
+        if unsafe { ShellExecuteExW(&mut info) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("安装程序未启动或管理员授权被取消");
+        }
+        if info.hProcess.is_null() {
+            bail!("无法确认后台安装程序的运行状态");
+        }
+        let mut code = 0;
+        // SAFETY: ShellExecuteExW returned an owned process handle. Wait on the
+        // controller thread, inspect its exit code, then close the handle once.
+        let success = unsafe {
+            let success = WaitForSingleObject(info.hProcess, INFINITE) == WAIT_OBJECT_0
+                && GetExitCodeProcess(info.hProcess, &mut code) != 0;
+            CloseHandle(info.hProcess);
+            success
+        };
+        if !success || code != 0 {
+            bail!("后台安装失败（退出码 {code}），请重试");
         }
     }
     Ok(())
-}
-
-#[derive(Default)]
-struct Live {
-    status: Option<Status>,
-    notice: Option<String>,
-    installed: bool,
-    busy: bool,
-    quit_ready: bool,
-    replacement_password: Option<Zeroizing<String>>,
-}
-struct Controller {
-    live: Arc<Mutex<Live>>,
-    stop: Arc<AtomicBool>,
-}
-impl Controller {
-    fn new() -> Self {
-        let live = Arc::new(Mutex::new(Live::default()));
-        let stop = Arc::new(AtomicBool::new(false));
-        let state = live.clone();
-        let closed = stop.clone();
-        std::thread::spawn(move || {
-            while !closed.load(Ordering::Relaxed) {
-                let result = service::request(Request::Status);
-                if let Ok(mut state) = state.lock() {
-                    state.installed = service::installed();
-                    if let Ok(status) = result {
-                        state.status = Some(status);
-                    } else {
-                        state.status = None;
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(750));
-            }
-        });
-        Self { live, stop }
-    }
-    fn action(&self, work: impl FnOnce() -> Result<()> + Send + 'static) {
-        if let Ok(mut state) = self.live.lock() {
-            if state.busy {
-                return;
-            }
-            state.busy = true;
-            state.notice = None;
-        }
-        let live = self.live.clone();
-        std::thread::spawn(move || {
-            let result = work();
-            if let Ok(mut state) = live.lock() {
-                state.busy = false;
-                state.notice = result.err().map(|error| error.to_string());
-            }
-        });
-    }
-    fn disconnect(&self) {
-        self.action(|| {
-            service::request(Request::Disconnect)?;
-            Ok(())
-        });
-    }
-}
-impl Drop for Controller {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
 }
 
 struct Desktop {
     gateway: Entity<InputState>,
     username: Entity<InputState>,
     password: Entity<InputState>,
-    pin: Entity<InputState>,
+    // Keep existing trust pins when migrating preferences, without exposing an editor.
+    cert_sha256: String,
     remember: bool,
     auto_login: bool,
     auto_update: bool,
@@ -339,15 +298,11 @@ impl Desktop {
                 .placeholder("VPN 密码")
                 .masked(true)
         });
-        let pin = cx.new(|cx| InputState::new(window, cx).placeholder("可选"));
         gateway.update(cx, |s, cx| {
             s.set_value(preferences.gateway.clone(), window, cx)
         });
         username.update(cx, |s, cx| {
             s.set_value(preferences.username.clone(), window, cx)
-        });
-        pin.update(cx, |s, cx| {
-            s.set_value(preferences.cert_sha256.clone(), window, cx)
         });
         if preferences.remember
             && let Ok(entry) = vault(&preferences)
@@ -397,7 +352,7 @@ impl Desktop {
             gateway,
             username,
             password,
-            pin,
+            cert_sha256: preferences.cert_sha256,
             remember: preferences.remember,
             auto_login: preferences.auto_login && preferences.remember,
             auto_update: preferences.auto_update,
@@ -473,12 +428,11 @@ impl Desktop {
             self.last_update = Instant::now();
         }
         if self.startup_pending {
-            let status = self
-                .controller
-                .live
-                .lock()
-                .ok()
-                .and_then(|s| s.status.clone());
+            let status = self.controller.live.lock().ok().and_then(|s| {
+                (s.readiness == Readiness::Ready && !s.busy && !s.quitting)
+                    .then(|| s.status.clone())
+                    .flatten()
+            });
             if let Some(status) = status {
                 self.startup_pending = false;
                 if self.auto_login
@@ -506,22 +460,20 @@ impl Desktop {
             let _ = logs.update(cx, |_, _, cx| cx.refresh_windows());
         }
 
-        let connected = self
+        let (phase, can_disconnect) = self
             .controller
             .live
             .lock()
-            .ok()
-            .and_then(|s| s.status.as_ref().map(|s| s.phase == Phase::Connected))
-            .unwrap_or(false);
+            .map(|s| (s.phase(), s.can_disconnect()))
+            .unwrap_or_default();
         let _ = self.tray.set_icon(Some(
-            tray_icon(connected).unwrap_or_else(|_| self.tray_icon_fallback()),
+            tray_icon(phase == Some(Phase::Connected))
+                .unwrap_or_else(|_| self.tray_icon_fallback()),
         ));
-        let _ = self.tray.set_tooltip(Some(if connected {
-            "EasyConnect · 已连接"
-        } else {
-            "EasyConnect · 未连接"
-        }));
-        self.disconnect.set_enabled(connected);
+        let _ = self
+            .tray
+            .set_tooltip(Some(format!("EasyConnect · {}", phase_style(phase).0)));
+        self.disconnect.set_enabled(can_disconnect);
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             let command = if event.id == *self.show.id() {
                 Some(MenuCommand::Show)
@@ -553,17 +505,10 @@ impl Desktop {
             remember: self.remember,
             auto_login: self.auto_login,
             auto_update: self.auto_update,
-            cert_sha256: self.pin.read(cx).value().to_string(),
+            cert_sha256: self.cert_sha256.clone(),
         };
         let password = Zeroizing::new(self.password.read(cx).value().to_string());
-        if !service::installed() {
-            if let Ok(mut s) = self.controller.live.lock() {
-                s.notice = Some("请先安装后台服务".into());
-            }
-            cx.notify();
-            return;
-        }
-        self.controller.action(move || {
+        let accepted = self.controller.connect(move || {
             crate::cli::validate_gateway(&preferences.gateway)?;
             if preferences.username.is_empty() || password.is_empty() {
                 bail!("请填写 VPN 账号与密码");
@@ -582,7 +527,7 @@ impl Desktop {
             Ok(())
         });
         self.password.update(cx, |s, cx| {
-            if !self.remember {
+            if accepted && !self.remember {
                 s.set_value("", window, cx);
             }
         });
@@ -701,7 +646,7 @@ impl Desktop {
             gateway: self.gateway.read(cx).value().to_string(),
             username: self.username.read(cx).value().to_string(),
             remember: self.remember,
-            cert_sha256: self.pin.read(cx).value().to_string(),
+            cert_sha256: self.cert_sha256.clone(),
             auto_login: self.auto_login,
             auto_update: self.auto_update,
         }
@@ -738,13 +683,7 @@ impl Desktop {
             MenuCommand::Password => self.open_password(cx),
             MenuCommand::Quit => {
                 self.startup_pending = false;
-                let live = self.controller.live.clone();
-                std::thread::spawn(move || {
-                    let _ = service::request(Request::Disconnect);
-                    if let Ok(mut s) = live.lock() {
-                        s.quit_ready = true;
-                    }
-                });
+                self.controller.quit();
             }
         }
     }
@@ -854,14 +793,18 @@ impl Render for Desktop {
                     .find_map(|line| ec_compat::password::PasswordPolicy::from_log(line))
             })
         });
-        let busy = live.as_ref().is_some_and(|s| s.busy);
-        let installed = live.as_ref().is_some_and(|s| s.installed);
+        let readiness = live.as_ref().map(|s| s.readiness).unwrap_or_default();
+        let phase = live.as_ref().and_then(|s| s.phase());
+        let can_connect = live.as_ref().is_some_and(|s| s.can_connect());
+        let can_disconnect = live.as_ref().is_some_and(|s| s.can_disconnect());
+        let connect_label = live
+            .as_ref()
+            .map(|s| s.connect_label())
+            .unwrap_or("正在准备…");
+        let loading = live.as_ref().is_some_and(|s| s.loading());
         let notice = live.as_ref().and_then(|s| s.notice.clone());
         drop(live);
-        let (state, color) = phase_style(status.as_ref().map(|s| s.phase));
-        let connected = status
-            .as_ref()
-            .is_some_and(|s| matches!(s.phase, Phase::Connected | Phase::Connecting));
+        let (state, color) = phase_style(phase);
         let update = self.updates.lock().map(|s| s.clone()).unwrap_or_default();
         let update_label = match &update {
             UpdateState::Available { version, .. } => format!("下载 v{version}"),
@@ -972,30 +915,51 @@ impl Render for Desktop {
                                     ),
                             )
                             .child(
-                                div().flex().gap(px(8.)).child(
-                                    button(
-                                        "connect",
-                                        if busy {
-                                            "处理中…"
-                                        } else if connected {
-                                            "断开连接"
-                                        } else {
-                                            "连接"
-                                        },
-                                        true,
-                                    )
-                                    .flex_1()
-                                    .on_click(cx.listener(
-                                        move |view, _, window, cx| {
-                                            if connected {
+                                div()
+                                    .flex()
+                                    .gap(px(8.))
+                                    .child(
+                                        Button::new("connect")
+                                            .label(connect_label)
+                                            .primary()
+                                            .rounded_none()
+                                            .h(px(36.))
+                                            .flex_1()
+                                            .loading(loading)
+                                            .disabled(!can_connect)
+                                            .on_click(cx.listener(|view, _, window, cx| {
                                                 view.startup_pending = false;
-                                                view.controller.disconnect();
-                                            } else {
                                                 view.connect(window, cx);
-                                            }
+                                            })),
+                                    )
+                                    .when(
+                                        matches!(
+                                            phase,
+                                            Some(
+                                                Phase::Connecting
+                                                    | Phase::Connected
+                                                    | Phase::Stopping
+                                            )
+                                        ),
+                                        |s| {
+                                            s.child(
+                                                Button::new("disconnect")
+                                                    .label(if phase == Some(Phase::Connecting) {
+                                                        "取消连接"
+                                                    } else {
+                                                        "断开连接"
+                                                    })
+                                                    .rounded_none()
+                                                    .h(px(36.))
+                                                    .disabled(!can_disconnect)
+                                                    .on_click(cx.listener(|view, _, _, cx| {
+                                                        view.startup_pending = false;
+                                                        view.controller.disconnect();
+                                                        cx.notify();
+                                                    })),
+                                            )
                                         },
-                                    )),
-                                ),
+                                    ),
                             )
                             .when_some(policy, |s, policy| {
                                 s.child(
@@ -1013,13 +977,6 @@ impl Render for Desktop {
                                             ),
                                         ),
                                 )
-                            })
-                            .when(!installed, |s| {
-                                s.child(button("install", "安装后台服务", false).on_click(
-                                    cx.listener(|view, _, _, _| {
-                                        view.controller.action(install_service)
-                                    }),
-                                ))
                             })
                             .child(
                                 div()
@@ -1073,7 +1030,6 @@ impl Render for Desktop {
                                         .border_t_1()
                                         .border_color(rgb(0x303e4e))
                                         .pt(px(12.))
-                                        .child(field("证书 SHA-256", &self.pin))
                                         .child(
                                             button(
                                                 "manual-change-password",
@@ -1086,17 +1042,11 @@ impl Render for Desktop {
                                                 }),
                                             ),
                                         )
-                                        .child(button("save-settings", "保存设置", false).on_click(
-                                            cx.listener(|view, _, _, cx| view.persist(cx)),
-                                        ))
-                                        .when(installed, |s| {
-                                            s.child(
-                                                button("update-service", "更新后台服务", false)
-                                                    .on_click(cx.listener(|view, _, _, _| {
-                                                        view.controller.action(install_service)
-                                                    })),
-                                            )
-                                        }),
+                                        .child(
+                                            button("save-settings", "保存设置", false).on_click(
+                                                cx.listener(|view, _, _, cx| view.persist(cx)),
+                                            ),
+                                        ),
                                 )
                             })
                             .when_some(notice, |s, notice| {
@@ -1118,6 +1068,7 @@ impl Render for Desktop {
                     .px(px(12.))
                     .flex()
                     .items_center()
+                    .justify_between()
                     .bg(rgb(0x18212c))
                     .border_t_1()
                     .border_color(rgb(0x303e4e))
@@ -1130,6 +1081,30 @@ impl Render for Desktop {
                             .child(div().text_color(rgb(color)).child(state))
                             .when_some(status.and_then(|s| s.address), |s, address| {
                                 s.child(address)
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .text_color(rgb(if readiness == Readiness::Ready {
+                                0x72cfa7
+                            } else {
+                                0xe1ad68
+                            }))
+                            .child(readiness.label())
+                            .when(readiness == Readiness::Failed, |s| {
+                                s.child(
+                                    Button::new("retry-prepare")
+                                        .label("重试")
+                                        .small()
+                                        .rounded_none()
+                                        .on_click(cx.listener(|view, _, _, cx| {
+                                            view.controller.retry();
+                                            cx.notify();
+                                        })),
+                                )
                             }),
                     ),
             )
@@ -1197,8 +1172,23 @@ impl Desktop {
     }
 }
 
+struct DesktopAssets;
+impl gpui::AssetSource for DesktopAssets {
+    fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        Ok((path == "icons/loader.svg")
+            .then(|| std::borrow::Cow::Borrowed(include_bytes!("../assets/loader.svg").as_slice())))
+    }
+    fn list(&self, path: &str) -> Result<Vec<gpui::SharedString>> {
+        Ok(if "icons/loader.svg".starts_with(path) {
+            vec!["icons/loader.svg".into()]
+        } else {
+            vec![]
+        })
+    }
+}
+
 pub fn run() -> Result<()> {
-    Application::new().run(|cx| {
+    Application::new().with_assets(DesktopAssets).run(|cx| {
         gpui_component::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
         let theme = Theme::global_mut(cx);
@@ -1247,6 +1237,20 @@ mod tests {
         let value = serde_json::to_value(Preferences::default()).unwrap();
         assert!(value.get("password").is_none());
         assert!(serde_json::from_str::<Preferences>(r#"{"gateway":"https://example.com","username":"u","remember":true,"cert_sha256":"","password":"secret"}"#).is_err());
+    }
+    #[test]
+    fn preferences_roundtrip_without_certificate_editor_preserves_existing_trust() {
+        let fresh = serde_json::to_string(&Preferences::default()).unwrap();
+        assert!(!fresh.contains("cert_sha256"));
+        assert!(serde_json::from_str::<Preferences>(&fresh).is_ok());
+        let legacy: Preferences = serde_json::from_str(r#"{"gateway":"https://example.com","username":"user","remember":true,"cert_sha256":"saved-pin"}"#).unwrap();
+        let saved = serde_json::to_string(&legacy).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Preferences>(&saved)
+                .unwrap()
+                .cert_sha256,
+            "saved-pin"
+        );
     }
     #[test]
     fn old_preferences_preserve_credentials_choices_and_gain_update_detection() {

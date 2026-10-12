@@ -532,7 +532,7 @@ fn logs(reader: impl Read + Send + 'static, state: Arc<Mutex<Status>>) {
                 state.password_policy = Some(policy);
             }
             let words: Vec<_> = line.split_whitespace().collect();
-            if line.starts_with("TUN ready:") {
+            if line.starts_with("TUN ready:") && state.phase == Phase::Connecting {
                 state.phase = Phase::Connected;
                 state.interface = words.get(2).map(|s| s.trim_end_matches(',').into());
                 state.address = words.get(4).map(|s| s.trim_end_matches(',').into());
@@ -751,13 +751,66 @@ fn install_macos(owner: &str, token: &std::path::Path) -> Result<()> {
     Ok(())
 }
 #[cfg(target_os = "windows")]
+fn stop_windows_service() -> Result<()> {
+    use windows_service::{
+        service::{ServiceAccess, ServiceState},
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service = match manager
+        .open_service(NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)
+    {
+        Ok(service) => service,
+        Err(windows_service::Error::Winapi(error))
+            if error.raw_os_error()
+                == Some(windows_sys::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let status = service.query_status()?;
+    if status.current_state == ServiceState::Stopped {
+        return Ok(());
+    }
+    // Retain the process handle before stopping, so SCM's Stopped notification
+    // cannot race copying the executable while its process is still exiting.
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, WAIT_OBJECT_0},
+        System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+    };
+    let pid = status
+        .process_id
+        .context("service process ID unavailable")?;
+    // SAFETY: a PID from SCM and SYNCHRONIZE-only access are passed to OpenProcess.
+    let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if process.is_null() {
+        return Err(std::io::Error::last_os_error()).context("cannot wait for service shutdown");
+    }
+    let result = (|| -> Result<()> {
+        if status.current_state != ServiceState::StopPending {
+            service.stop()?;
+        }
+        // SAFETY: process is a live owned handle, closed below on all paths.
+        if unsafe { WaitForSingleObject(process, 30_000) } != WAIT_OBJECT_0 {
+            bail!("background service did not stop; update was not applied");
+        }
+        Ok(())
+    })();
+    // SAFETY: close our OpenProcess handle exactly once, including on stop errors.
+    unsafe {
+        CloseHandle(process);
+    }
+    result
+}
+
+#[cfg(target_os = "windows")]
 fn install_windows(owner: &str, token: &std::path::Path) -> Result<()> {
     let source = std::env::current_exe()?;
     let dir = known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles)?
         .join("EasyConnect Rust");
     std::fs::create_dir_all(&dir)?;
-    let _ = Command::new("sc.exe").args(["stop", NAME]).status();
-    std::thread::sleep(Duration::from_secs(2));
+    stop_windows_service()?;
     let binary = dir.join("easy-connect.exe");
     std::fs::copy(&source, &binary)?;
     std::fs::copy(source.with_file_name("wintun.dll"), dir.join("wintun.dll"))?;
