@@ -188,7 +188,11 @@ impl DnsProxy {
         policy: Arc<RoutePolicy>,
         routes: SharedRoutes,
     ) -> Result<Self> {
-        let udp = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?);
+        #[cfg(target_os = "macos")]
+        let port = 0;
+        #[cfg(target_os = "windows")]
+        let port = 53;
+        let udp = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).await?);
         let tcp = TcpListener::bind(udp.local_addr()?).await?;
         Ok(Self {
             udp,
@@ -243,69 +247,77 @@ impl DnsProxy {
     }
 }
 
-use core_foundation::{
-    array::CFArray, base::TCFType, dictionary::CFDictionary, number::CFNumber, string::CFString,
-};
-use system_configuration::dynamic_store::{SCDynamicStore, SCDynamicStoreBuilder};
-use system_configuration_sys::dynamic_store::SCDynamicStoreAddTemporaryValue;
+#[cfg(target_os = "macos")]
+mod platform {
+    use super::*;
+    use core_foundation::{
+        array::CFArray, base::TCFType, dictionary::CFDictionary, number::CFNumber, string::CFString,
+    };
+    use system_configuration::dynamic_store::{SCDynamicStore, SCDynamicStoreBuilder};
+    use system_configuration_sys::dynamic_store::SCDynamicStoreAddTemporaryValue;
 
-pub struct SplitDns {
-    store: SCDynamicStore,
-    key: String,
-}
-impl SplitDns {
-    pub fn install(interface: &str, port: u16, domains: &[String]) -> Result<Self> {
-        let store = SCDynamicStoreBuilder::new("easy-connect split DNS").build();
-        let key = format!(
-            "State:/Network/Service/easy-connect-{}-{interface}/DNS",
-            std::process::id()
-        );
-        let addresses = CFArray::from_CFTypes(&[CFString::new("127.0.0.1")]);
-        let matches =
-            CFArray::from_CFTypes(&domains.iter().map(|d| CFString::new(d)).collect::<Vec<_>>());
-        let dictionary = CFDictionary::from_CFType_pairs(&[
-            (CFString::new("ServerAddresses"), addresses.as_CFType()),
-            (
-                CFString::new("ServerPort"),
-                CFNumber::from(i32::from(port)).as_CFType(),
-            ),
-            (
-                CFString::new("SupplementalMatchDomains"),
-                matches.as_CFType(),
-            ),
-            (
-                CFString::new("SupplementalMatchDomainsNoSearch"),
-                CFNumber::from(1_i32).as_CFType(),
-            ),
-            (
-                CFString::new("SearchOrder"),
-                CFNumber::from(1_i32).as_CFType(),
-            ),
-        ]);
-        let cf_key = CFString::new(&key);
-        // SAFETY: the store, key and property-list dictionary are retained CF objects.
-        // AddTemporaryValue copies their values and binds cleanup to this store session.
-        let success = unsafe {
-            SCDynamicStoreAddTemporaryValue(
-                store.as_concrete_TypeRef(),
-                cf_key.as_concrete_TypeRef(),
-                dictionary.as_CFTypeRef(),
-            )
-        };
-        if success == 0 {
-            bail!("cannot register temporary macOS split DNS");
-        }
-        Ok(Self { store, key })
+    pub struct SplitDns {
+        store: SCDynamicStore,
+        key: String,
     }
-}
-impl Drop for SplitDns {
-    fn drop(&mut self) {
-        if !self.store.remove(self.key.as_str()) {
-            eprintln!("split DNS key was already removed or could not be removed");
+    impl SplitDns {
+        pub fn install(interface: &str, port: u16, domains: &[String]) -> Result<Self> {
+            let store = SCDynamicStoreBuilder::new("easy-connect split DNS").build();
+            let key = format!(
+                "State:/Network/Service/easy-connect-{}-{interface}/DNS",
+                std::process::id()
+            );
+            let addresses = CFArray::from_CFTypes(&[CFString::new("127.0.0.1")]);
+            let matches = CFArray::from_CFTypes(
+                &domains.iter().map(|d| CFString::new(d)).collect::<Vec<_>>(),
+            );
+            let dictionary = CFDictionary::from_CFType_pairs(&[
+                (CFString::new("ServerAddresses"), addresses.as_CFType()),
+                (
+                    CFString::new("ServerPort"),
+                    CFNumber::from(i32::from(port)).as_CFType(),
+                ),
+                (
+                    CFString::new("SupplementalMatchDomains"),
+                    matches.as_CFType(),
+                ),
+                (
+                    CFString::new("SupplementalMatchDomainsNoSearch"),
+                    CFNumber::from(1_i32).as_CFType(),
+                ),
+                (
+                    CFString::new("SearchOrder"),
+                    CFNumber::from(1_i32).as_CFType(),
+                ),
+            ]);
+            let cf_key = CFString::new(&key);
+            // SAFETY: the store, key and property-list dictionary are retained CF objects.
+            // AddTemporaryValue copies their values and binds cleanup to this store session.
+            let success = unsafe {
+                SCDynamicStoreAddTemporaryValue(
+                    store.as_concrete_TypeRef(),
+                    cf_key.as_concrete_TypeRef(),
+                    dictionary.as_CFTypeRef(),
+                )
+            };
+            if success == 0 {
+                bail!("cannot register temporary macOS split DNS");
+            }
+            Ok(Self { store, key })
         }
     }
+    impl Drop for SplitDns {
+        fn drop(&mut self) {
+            if !self.store.remove(self.key.as_str()) {
+                eprintln!("split DNS key was already removed or could not be removed");
+            }
+        }
+    }
 }
-
+#[cfg(target_os = "windows")]
+pub use super::windows_dns::SplitDns;
+#[cfg(target_os = "macos")]
+pub use platform::SplitDns;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +377,7 @@ mod tests {
         ipv6[end - 3] = 28;
         assert_eq!(state.query(&ipv6).await.unwrap()[6..8], [0, 0]);
     }
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn loopback_dns_handles_udp_and_tcp_without_system_changes() {
         let policy=Arc::new(RoutePolicy::from_config(&serde_json::json!({"proxy":{"route_domains":["example.edu"],"route_ipv4_cidrs":[]}})).unwrap());

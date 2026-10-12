@@ -102,6 +102,7 @@ pub trait RouteCommands: Send + Sync {
 }
 
 /// macOS netstat abbreviates networks (e.g. `166.111/16`, `10/8`).
+#[cfg(any(target_os = "macos", test))]
 fn table_cidr(value: &str) -> Result<Cidr> {
     let (address, explicit_prefix) = value
         .split_once('/')
@@ -125,6 +126,7 @@ fn table_cidr(value: &str) -> Result<Cidr> {
     Cidr::parse(&format!("{}/{prefix}", Ipv4Addr::from(full)))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_route_table(text: &str) -> Result<BTreeSet<(Cidr, String)>> {
     let mut interface_column = None;
     let mut routes = BTreeSet::new();
@@ -149,6 +151,7 @@ fn parse_route_table(text: &str) -> Result<BTreeSet<(Cidr, String)>> {
 
 pub struct SystemRoutes;
 impl RouteCommands for SystemRoutes {
+    #[cfg(target_os = "macos")]
     fn change(&self, add: bool, cidr: Cidr, interface: &str) -> Result<()> {
         let output = Command::new("/sbin/route")
             .args([
@@ -173,6 +176,7 @@ impl RouteCommands for SystemRoutes {
         }
         Ok(())
     }
+    #[cfg(target_os = "macos")]
     fn snapshot(&self) -> Result<Option<BTreeSet<(Cidr, String)>>> {
         let output = Command::new("/usr/sbin/netstat")
             .args(["-rn", "-f", "inet"])
@@ -183,6 +187,56 @@ impl RouteCommands for SystemRoutes {
             bail!("cannot read kernel route table");
         }
         Ok(Some(parse_route_table(&String::from_utf8(output.stdout)?)?))
+    }
+    #[cfg(target_os = "windows")]
+    fn change(&self, add: bool, cidr: Cidr, interface: &str) -> Result<()> {
+        let prefix = format!("prefix={}", cidr.text());
+        let alias = format!("interface={interface}");
+        let mut command = Command::new("netsh.exe");
+        command.args([
+            "interface",
+            "ipv4",
+            if add { "add" } else { "delete" },
+            "route",
+            &prefix,
+            &alias,
+            "store=active",
+        ]);
+        if add {
+            command.args(["nexthop=0.0.0.0", "metric=5"]);
+        }
+        let output = command.output()?;
+        if !output.status.success() {
+            bail!(
+                "Windows route operation failed: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "windows")]
+    fn snapshot(&self) -> Result<Option<BTreeSet<(Cidr, String)>>> {
+        let output=Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-Command","Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore | Select-Object DestinationPrefix,InterfaceAlias | ConvertTo-Json -Compress"]).output()?;
+        if !output.status.success() {
+            bail!("cannot inspect Windows route table");
+        }
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let values = match value {
+            serde_json::Value::Array(rows) => rows,
+            serde_json::Value::Null => vec![],
+            value => vec![value],
+        };
+        let mut table = BTreeSet::new();
+        for row in values {
+            if let (Some(prefix), Some(alias)) = (
+                row["DestinationPrefix"].as_str(),
+                row["InterfaceAlias"].as_str(),
+            ) && let Ok(cidr) = Cidr::parse(prefix)
+            {
+                table.insert((cidr, alias.to_owned()));
+            }
+        }
+        Ok(Some(table))
     }
 }
 
@@ -304,18 +358,34 @@ impl<R: RouteCommands> Drop for RouteManager<R> {
 }
 
 pub fn physical_gateway(peer: Ipv4Addr) -> Result<Option<Ipv4Addr>> {
-    let output = Command::new("/sbin/route")
-        .args(["-n", "get", "-inet", &peer.to_string()])
-        .output()?;
-    if !output.status.success() {
-        bail!("cannot inspect outer VPN route");
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("/sbin/route")
+            .args(["-n", "get", "-inet", &peer.to_string()])
+            .output()?;
+        if !output.status.success() {
+            bail!("cannot inspect outer VPN route");
+        }
+        let text = String::from_utf8(output.stdout)?;
+        Ok(text.lines().find_map(|l| {
+            l.trim()
+                .strip_prefix("gateway:")
+                .and_then(|v| v.trim().parse().ok())
+        }))
     }
-    let text = String::from_utf8(output.stdout)?;
-    Ok(text.lines().find_map(|l| {
-        l.trim()
-            .strip_prefix("gateway:")
-            .and_then(|v| v.trim().parse().ok())
-    }))
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!(
+            "Find-NetRoute -RemoteIPAddress '{peer}' | Where-Object {{ $_.NextHop -and $_.NextHop -ne '0.0.0.0' }} | Select-Object -First 1 -ExpandProperty NextHop"
+        );
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()?;
+        if !output.status.success() {
+            bail!("cannot inspect Windows VPN outer route");
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().parse().ok())
+    }
 }
 
 pub trait RoutingTable: Send {
