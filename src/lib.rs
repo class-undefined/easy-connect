@@ -1,4 +1,6 @@
 pub mod cli;
+#[cfg(feature = "desktop")]
+pub mod desktop;
 mod resources;
 pub mod service;
 mod tun;

@@ -1,9 +1,19 @@
 [package]
 name = "easy-connect"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.94"
 license = "GPL-3.0-only AND AGPL-3.0-only"
+default-run = "easy-connect"
+
+[features]
+default = []
+desktop = ["dep:gpui", "dep:gpui-component", "dep:tray-icon", "dep:keyring", "dep:dirs", "dep:raw-window-handle"]
+
+[[bin]]
+name = "easy-connect-gui"
+path = "src/bin/easy-connect-gui.rs"
+required-features = ["desktop"]
 
 [dependencies]
 anyhow = "1"
@@ -17,7 +27,17 @@ url = "2"
 zeroize = "1"
 serde = { version = "1", features = ["derive"] }
 rand = "0.8"
+sha2 = "0.10"
 hex = "0.4"
+gpui = { version = "=0.2.2", optional = true, default-features = false, features = ["font-kit", "windows-manifest", "runtime_shaders"] }
+gpui-component = { version = "=0.5.1", optional = true }
+tray-icon = { version = "=0.21.2", optional = true, default-features = false }
+keyring = { version = "=3.6.3", optional = true, features = ["apple-native", "windows-native"] }
+dirs = { version = "6", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+tun-rs = { version = "=2.8.11", features = ["async_tokio"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
@@ -25,15 +45,14 @@ core-foundation = "0.9"
 system-configuration = "0.6"
 system-configuration-sys = "0.6"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_Threading"] }
+windows-service = "0.8"
+
 [profile.release]
 lto = "thin"
 strip = true
 
+[build-dependencies]
+winresource = "0.1"
 
-[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
-tun-rs = { version = "=2.8.11", features = ["async_tokio"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_System_Threading"] }
-
-windows-service = "0.8"
