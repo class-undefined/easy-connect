@@ -20,6 +20,8 @@ use std::{
     time::Duration,
 };
 use zeroize::{Zeroize, Zeroizing};
+#[cfg(target_os = "macos")]
+mod macos_install;
 #[cfg(target_os = "windows")]
 const PORT: u16 = 40571;
 const LIMIT: u64 = 16384;
@@ -162,6 +164,10 @@ pub struct Status {
     pub version: String,
     #[serde(default)]
     pub password_policy: Option<ec_compat::password::PasswordPolicy>,
+    #[serde(default)]
+    pub resource_catalog: crate::resources::ResourceCatalog,
+    #[serde(default)]
+    pub session_end: Option<ec_compat::session_status::SessionEndReason>,
 }
 impl Default for Status {
     fn default() -> Self {
@@ -175,6 +181,8 @@ impl Default for Status {
             logs: VecDeque::new(),
             version: env!("CARGO_PKG_VERSION").into(),
             password_policy: None,
+            resource_catalog: Default::default(),
+            session_end: None,
         }
     }
 }
@@ -393,6 +401,7 @@ struct Worker {
     child: Option<Child>,
     input: Option<ChildStdin>,
     status: Arc<Mutex<Status>>,
+    log_readers: Vec<std::thread::JoinHandle<()>>,
 }
 impl Worker {
     fn refresh(&mut self) -> Result<()> {
@@ -403,18 +412,16 @@ impl Worker {
             crate::tun::cleanup_worker_dns(child.id());
             self.child = None;
             self.input = None;
+            // Drain terminal events before publishing exit or accepting a new
+            // connection; old reader threads must not mutate the next session.
+            for reader in self.log_readers.drain(..) {
+                let _ = reader.join();
+            }
             let mut s = self
                 .status
                 .lock()
                 .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
-            s.phase = if exit.success() {
-                Phase::Disconnected
-            } else {
-                Phase::Failed
-            };
-            s.interface = None;
-            s.address = None;
-            s.routes = 0;
+            finish_worker(&mut s, exit.success());
         }
         Ok(())
     }
@@ -423,13 +430,21 @@ impl Worker {
         match request {
             Request::Status => {}
             Request::Disconnect => {
-                if let Some(input) = &mut self.input {
-                    input.write_all(b"stop\n")?;
-                    input.flush()?;
-                    self.status
+                {
+                    let mut state = self
+                        .status
                         .lock()
-                        .map_err(|_| anyhow::anyhow!("state lock poisoned"))?
-                        .phase = Phase::Stopping;
+                        .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+                    state.session_end = None;
+                    if self.child.is_some() {
+                        state.phase = Phase::Stopping;
+                    }
+                }
+                if let Some(input) = &mut self.input
+                    && let Err(error) = input.write_all(b"stop\n").and_then(|_| input.flush())
+                    && error.kind() != std::io::ErrorKind::BrokenPipe
+                {
+                    return Err(error.into());
                 }
             }
             Request::Connect {
@@ -481,10 +496,10 @@ impl Worker {
                     ..Default::default()
                 };
                 if let Some(out) = child.stdout.take() {
-                    logs(out, self.status.clone());
+                    self.log_readers.push(logs(out, self.status.clone()));
                 }
                 if let Some(out) = child.stderr.take() {
-                    logs(out, self.status.clone());
+                    self.log_readers.push(logs(out, self.status.clone()));
                 }
                 self.child = Some(child);
                 self.input = Some(input);
@@ -515,7 +530,67 @@ impl Drop for Worker {
         }
     }
 }
-fn logs(reader: impl Read + Send + 'static, state: Arc<Mutex<Status>>) {
+fn finish_worker(state: &mut Status, success: bool) {
+    if state.phase == Phase::Stopping {
+        state.session_end = None;
+        state.phase = Phase::Disconnected;
+    } else {
+        if state.phase == Phase::Connected && state.session_end.is_none() && !success {
+            state.session_end = Some(ec_compat::session_status::SessionEndReason::ConnectionLost);
+        }
+        state.phase = if success && state.session_end.is_none() {
+            Phase::Disconnected
+        } else {
+            Phase::Failed
+        };
+    }
+    state.interface = None;
+    state.address = None;
+    state.routes = 0;
+    state.resources = 0;
+    state.groups = 0;
+    state.resource_catalog = Default::default();
+}
+
+fn ingest_worker_line(state: &mut Status, line: String) {
+    if let Some(reason) = ec_compat::session_status::SessionEndReason::from_log(&line) {
+        if state.phase != Phase::Stopping {
+            state.session_end = Some(reason);
+            append_log(state, reason.message().to_owned());
+        }
+        return;
+    }
+    if state.resource_catalog.consume_event(&line) {
+        return;
+    }
+    if let Some(policy) = ec_compat::password::PasswordPolicy::from_log(&line) {
+        state.password_policy = Some(policy);
+    }
+    let words: Vec<_> = line.split_whitespace().collect();
+    if line.starts_with("TUN ready:") && state.phase == Phase::Connecting {
+        state.phase = Phase::Connected;
+        state.interface = words.get(2).map(|s| s.trim_end_matches(',').into());
+        state.address = words.get(4).map(|s| s.trim_end_matches(',').into());
+        state.routes = words.get(7).and_then(|s| s.parse().ok()).unwrap_or(0);
+    }
+    if line.starts_with("Loaded ") {
+        state.resources = words.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        state.groups = words.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+    }
+    append_log(state, line);
+}
+
+fn append_log(state: &mut Status, line: String) {
+    state.logs.push_back(line);
+    while state.logs.len() > 100 || state.logs.iter().map(String::len).sum::<usize>() > 64 * 1024 {
+        state.logs.pop_front();
+    }
+}
+
+fn logs(
+    reader: impl Read + Send + 'static,
+    state: Arc<Mutex<Status>>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         loop {
@@ -528,26 +603,42 @@ fn logs(reader: impl Read + Send + 'static, state: Arc<Mutex<Status>>) {
             let Ok(mut state) = state.lock() else {
                 break;
             };
-            if let Some(policy) = ec_compat::password::PasswordPolicy::from_log(&line) {
-                state.password_policy = Some(policy);
-            }
-            let words: Vec<_> = line.split_whitespace().collect();
-            if line.starts_with("TUN ready:") && state.phase == Phase::Connecting {
-                state.phase = Phase::Connected;
-                state.interface = words.get(2).map(|s| s.trim_end_matches(',').into());
-                state.address = words.get(4).map(|s| s.trim_end_matches(',').into());
-                state.routes = words.get(7).and_then(|s| s.parse().ok()).unwrap_or(0);
-            }
-            if line.starts_with("Loaded ") {
-                state.resources = words.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-                state.groups = words.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
-            }
-            state.logs.push_back(line);
-            while state.logs.len() > 100 {
-                state.logs.pop_front();
-            }
+            ingest_worker_line(&mut state, line);
         }
-    });
+    })
+}
+fn authenticate_request(
+    socket: &mut TcpStream,
+    capability: &[u8],
+) -> Result<(String, String, Request)> {
+    // macOS accept() inherits O_NONBLOCK from the listener. Each handshake
+    // exchanges multiple frames, so wait for the peer using bounded I/O.
+    socket.set_nonblocking(false)?;
+    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let client: Challenge = receive(socket, LIMIT)?;
+    if !valid_nonce(&client.nonce) {
+        bail!("invalid client nonce");
+    }
+    let server = nonce();
+    send_frame(
+        socket,
+        &ServerProof {
+            proof: proof(capability, "server", &client.nonce, &server, ""),
+            nonce: server.clone(),
+        },
+    )?;
+    let frame: Frame = receive(socket, LIMIT)?;
+    verify(
+        capability,
+        "request",
+        &client.nonce,
+        &server,
+        &frame.payload,
+        &frame.proof,
+    )?;
+    let request: Request = serde_json::from_str(&frame.payload)?;
+    Ok((client.nonce, server, request))
 }
 pub fn run(owner: &str, stop: Arc<AtomicBool>) -> Result<()> {
     crate::tun::preflight()?;
@@ -587,6 +678,7 @@ pub fn run(owner: &str, stop: Arc<AtomicBool>) -> Result<()> {
         child: None,
         input: None,
         status: Arc::new(Mutex::new(Status::default())),
+        log_readers: Vec::new(),
     };
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
@@ -597,40 +689,9 @@ pub fn run(owner: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 }
                 #[cfg(target_os = "macos")]
                 let _ = peer;
-                socket.set_read_timeout(Some(Duration::from_secs(2)))?;
-                socket.set_write_timeout(Some(Duration::from_secs(2)))?;
-                let exchange = (|| -> Result<(String, String, Request)> {
-                    let client: Challenge = receive(&mut socket, LIMIT)?;
-                    if !valid_nonce(&client.nonce) {
-                        bail!("invalid client nonce");
-                    }
-                    let server = nonce();
-                    send_frame(
-                        &mut socket,
-                        &ServerProof {
-                            proof: proof(
-                                capability.as_bytes(),
-                                "server",
-                                &client.nonce,
-                                &server,
-                                "",
-                            ),
-                            nonce: server.clone(),
-                        },
-                    )?;
-                    let frame: Frame = receive(&mut socket, LIMIT)?;
-                    verify(
-                        capability.as_bytes(),
-                        "request",
-                        &client.nonce,
-                        &server,
-                        &frame.payload,
-                        &frame.proof,
-                    )?;
-                    let request: Request = serde_json::from_str(&frame.payload)?;
-                    Ok((client.nonce, server, request))
-                })();
-                let Ok((client, server, request)) = exchange else {
+                let Ok((client, server, request)) =
+                    authenticate_request(&mut socket, capability.as_bytes())
+                else {
                     continue;
                 };
                 let result = worker.handle(&request);
@@ -713,42 +774,7 @@ pub fn install(owner: &str) -> Result<()> {
 }
 #[cfg(target_os = "macos")]
 fn install_macos(owner: &str, token: &std::path::Path) -> Result<()> {
-    use std::{
-        ffi::CString,
-        os::unix::{ffi::OsStrExt, fs::PermissionsExt},
-    };
-    let path = CString::new(token.as_os_str().as_bytes())?;
-    // SAFETY: a validated UID and live NUL-terminated path are passed to chown.
-    if unsafe { libc::chown(path.as_ptr(), owner.parse()?, u32::MAX) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    std::fs::set_permissions(token, std::fs::Permissions::from_mode(0o600))?;
-    let label = "com.easy-connect.service";
-    let destination = PathBuf::from("/Library/PrivilegedHelperTools/easy-connect");
-    std::fs::create_dir_all(destination.parent().context("destination missing")?)?;
-    let _ = Command::new("/bin/launchctl")
-        .args(["bootout", &format!("system/{label}")])
-        .status();
-    let temp = destination.with_extension("new");
-    std::fs::copy(std::env::current_exe()?, &temp)?;
-    std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755))?;
-    std::fs::rename(temp, &destination)?;
-    let plist = PathBuf::from(format!("/Library/LaunchDaemons/{label}.plist"));
-    let xml = format!(
-        r#"<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>{}</string><string>service</string><string>--owner</string><string>{owner}</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ProcessType</key><string>Background</string></dict></plist>"#,
-        destination.display()
-    );
-    std::fs::write(&plist, xml)?;
-    std::fs::set_permissions(&plist, std::fs::Permissions::from_mode(0o644))?;
-    if !Command::new("/bin/launchctl")
-        .args(["bootstrap", "system"])
-        .arg(plist)
-        .status()?
-        .success()
-    {
-        bail!("launchd could not start service");
-    }
-    Ok(())
+    macos_install::install(owner, token)
 }
 #[cfg(target_os = "windows")]
 fn stop_windows_service() -> Result<()> {
@@ -904,6 +930,151 @@ pub fn run_windows(owner: String) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ec_compat::session_status::SessionEndReason;
+
+    #[test]
+    fn worker_resource_events_do_not_fill_logs_and_are_cleared_on_exit() {
+        let rows = (1..100)
+            .map(|id| format!(r#"<Rc id="{id}" name="资源{id}" host="10.0.0.{id}"/>"#))
+            .collect::<String>();
+        let published = crate::resources::PublishedResources::parse(
+            format!("<Resource>{rows}</Resource>").as_bytes(),
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        crate::resources::ResourceCatalog::from_published(&published)
+            .write_events(&mut events)
+            .unwrap();
+        assert!(events.len() > 8192);
+        let state = Arc::new(Mutex::new(Status {
+            phase: Phase::Connecting,
+            ..Default::default()
+        }));
+        logs(std::io::Cursor::new(events), state.clone())
+            .join()
+            .unwrap();
+        let mut state = state.lock().unwrap();
+        assert_eq!(state.resource_catalog.entries.len(), 99);
+        assert!(state.logs.is_empty());
+        finish_worker(&mut state, true);
+        assert!(state.resource_catalog.entries.is_empty());
+    }
+
+    #[test]
+    fn confirmed_kick_is_retained_but_a_user_stop_suppresses_terminal_events() {
+        let mut state = Status {
+            phase: Phase::Connected,
+            ..Default::default()
+        };
+        ingest_worker_line(&mut state, SessionEndReason::PrivateKick.marker());
+        finish_worker(&mut state, false);
+        assert_eq!(state.phase, Phase::Failed);
+        assert_eq!(state.session_end, Some(SessionEndReason::PrivateKick));
+        assert!(state.logs.back().unwrap().contains("其他设备"));
+
+        let mut stopped = Status {
+            phase: Phase::Stopping,
+            ..Default::default()
+        };
+        ingest_worker_line(&mut stopped, SessionEndReason::PrivateKick.marker());
+        finish_worker(&mut stopped, false);
+        assert_eq!(stopped.phase, Phase::Disconnected);
+        assert!(stopped.session_end.is_none());
+        assert!(stopped.logs.is_empty());
+    }
+
+    #[test]
+    fn an_unexplained_transport_exit_is_never_labeled_as_a_kick() {
+        let mut state = Status {
+            phase: Phase::Connected,
+            ..Default::default()
+        };
+        finish_worker(&mut state, false);
+        assert_eq!(state.session_end, Some(SessionEndReason::ConnectionLost));
+    }
+
+    #[test]
+    fn older_broker_status_remains_readable() {
+        let mut value = serde_json::to_value(Status::default()).unwrap();
+        let fields = value.as_object_mut().unwrap();
+        fields.remove("resource_catalog");
+        fields.remove("session_end");
+        let status: Status = serde_json::from_value(value).unwrap();
+        assert!(status.resource_catalog.entries.is_empty());
+        assert!(status.session_end.is_none());
+    }
+
+    #[test]
+    fn large_catalog_and_logs_fit_the_authenticated_response_frame() {
+        let mut published = crate::resources::PublishedResources::parse(b"<Resource/>").unwrap();
+        published.entries = vec![serde_json::json!({"host":"\\\"".repeat(1024)}); 10_000];
+        let mut state = Status {
+            resource_catalog: crate::resources::ResourceCatalog::from_published(&published),
+            ..Default::default()
+        };
+        for _ in 0..100 {
+            append_log(&mut state, "\0".repeat(8192));
+        }
+        let frame = Frame {
+            payload: serde_json::to_string(&Response {
+                status: Some(state),
+                error: None,
+            })
+            .unwrap(),
+            proof: "0".repeat(64),
+        };
+        assert!(serde_json::to_vec(&frame).unwrap().len() + 1 < 2 * 1024 * 1024);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn accepted_socket_waits_for_authenticated_request_after_server_proof() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("ec-{}.sock", &nonce()[..16]));
+        let listener = TcpListener::bind(&path)?;
+        let _guard = SocketGuard(path.clone());
+        listener.set_nonblocking(true)?;
+        let mut client = TcpStream::connect(&path)?;
+        client.set_read_timeout(Some(Duration::from_secs(3)))?;
+        client.set_write_timeout(Some(Duration::from_secs(3)))?;
+        let client_nonce = nonce();
+        send_frame(
+            &mut client,
+            &Challenge {
+                nonce: client_nonce.clone(),
+            },
+        )?;
+        let (mut socket, _) = listener.accept()?;
+        let server = std::thread::spawn(move || authenticate_request(&mut socket, b"test-key"));
+        let server_proof: ServerProof = receive(&mut client, LIMIT)?;
+        verify(
+            b"test-key",
+            "server",
+            &client_nonce,
+            &server_proof.nonce,
+            "",
+            &server_proof.proof,
+        )?;
+        // The server must wait while the client verifies its proof, even though
+        // macOS inherits O_NONBLOCK from the listening socket on accept().
+        std::thread::sleep(Duration::from_millis(50));
+        let payload = serde_json::to_string(&Request::Status)?;
+        let sent = send_frame(
+            &mut client,
+            &Frame {
+                proof: proof(
+                    b"test-key",
+                    "request",
+                    &client_nonce,
+                    &server_proof.nonce,
+                    &payload,
+                ),
+                payload,
+            },
+        );
+        let (_, _, request) = server.join().expect("broker thread panicked")?;
+        sent?;
+        assert!(matches!(request, Request::Status));
+        Ok(())
+    }
     #[test]
     fn credentials_cannot_inject_worker_control() {
         for password in ["a\nb", "a\rb", "a\0b", ""] {

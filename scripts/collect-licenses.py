@@ -5,7 +5,7 @@ import subprocess
 
 root = pathlib.Path(__file__).resolve().parent.parent
 metadata = json.loads(subprocess.check_output(
-    ["cargo", "metadata", "--locked", "--format-version", "1"], cwd=root))
+    ["cargo", "metadata", "--locked", "--features", "desktop", "--format-version", "1"], cwd=root))
 destination = root / ".release-stage" / "DEPENDENCY-LICENSES.txt"
 destination.parent.mkdir(exist_ok=True)
 with destination.open("w", encoding="utf-8") as output:

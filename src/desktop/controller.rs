@@ -32,6 +32,32 @@ pub(super) struct Live {
     pending: Option<Phase>,
 }
 impl Live {
+    fn observe_status(&mut self, result: Result<Status>) {
+        match result {
+            Ok(status) if current_version(&status) => {
+                self.status = Some(status);
+                if self.readiness == Readiness::Failed {
+                    self.notice = None;
+                }
+                self.readiness = Readiness::Ready;
+            }
+            result => {
+                self.status = None;
+                if self.readiness == Readiness::Ready {
+                    self.readiness = Readiness::Failed;
+                    self.notice = Some(match result {
+                        Ok(status) => format!(
+                            "后台版本已变更（{}），请点击重试检查连接环境",
+                            status.version
+                        ),
+                        Err(error) => {
+                            format!("无法连接后台服务：{error:#}；请点击重试检查连接环境")
+                        }
+                    });
+                }
+            }
+        }
+    }
     pub(super) fn phase(&self) -> Option<Phase> {
         self.pending
             .or_else(|| self.status.as_ref().map(|s| s.phase))
@@ -44,9 +70,9 @@ impl Live {
     }
     pub(super) fn can_disconnect(&self) -> bool {
         self.readiness == Readiness::Ready
-            && !self.busy
             && !self.quitting
             && matches!(self.phase(), Some(Phase::Connecting | Phase::Connected))
+            && (!self.busy || self.phase() == Some(Phase::Connecting))
     }
     pub(super) fn connect_label(&self) -> &'static str {
         if self.quitting {
@@ -57,8 +83,8 @@ impl Live {
             Readiness::Updating => "正在更新…",
             Readiness::Failed => "暂不可连接",
             Readiness::Ready => match self.phase() {
-                Some(Phase::Connecting) => "连接中…",
-                Some(Phase::Connected) => "已连接",
+                Some(Phase::Connecting) => "取消连接",
+                Some(Phase::Connected) => "断开连接",
                 Some(Phase::Stopping) => "正在断开…",
                 _ if self.busy => "处理中…",
                 _ => "连接",
@@ -71,11 +97,27 @@ impl Live {
             || matches!(self.readiness, Readiness::Preparing | Readiness::Updating)
             || matches!(self.phase(), Some(Phase::Connecting | Phase::Stopping))
     }
+
+    fn finish_action(
+        &mut self,
+        pending: Option<Phase>,
+        result: Result<()>,
+        status: Option<Status>,
+    ) {
+        self.status = status;
+        // A cancel can be queued while the connect request is still in flight.
+        // Only the last queued action may release its UI state or set a notice.
+        if self.pending == pending {
+            self.pending = None;
+            self.busy = false;
+            self.notice = result.err().map(|e| format!("{e:#}"));
+        }
+    }
 }
 
 type Work = Box<dyn FnOnce() -> Result<()> + Send>;
 enum Command {
-    Action(Work),
+    Action { pending: Option<Phase>, work: Work },
     Prepare,
     Quit,
 }
@@ -103,14 +145,11 @@ impl Controller {
             prepare(&state);
             loop {
                 match receiver.recv_timeout(POLL) {
-                    Ok(Command::Action(work)) => {
+                    Ok(Command::Action { pending, work }) => {
                         let result = work();
                         let status = service::request(Request::Status).ok();
                         if let Ok(mut live) = state.lock() {
-                            live.status = status;
-                            live.pending = None;
-                            live.busy = false;
-                            live.notice = result.err().map(|e| format!("{e:#}"));
+                            live.finish_action(pending, result, status);
                         }
                     }
                     Ok(Command::Prepare) => prepare(&state),
@@ -133,25 +172,11 @@ impl Controller {
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        let status = service::request(Request::Status).ok();
-                        let compatible = status.as_ref().is_some_and(current_version);
-                        let repair = if let Ok(mut live) = state.lock() {
-                            let repair = !compatible && live.readiness == Readiness::Ready;
-                            live.status = status;
-                            if compatible {
-                                if live.readiness == Readiness::Failed {
-                                    live.notice = None;
-                                }
-                                live.readiness = Readiness::Ready;
-                            } else if repair {
-                                live.readiness = Readiness::Preparing;
-                            }
-                            repair
-                        } else {
-                            false
-                        };
-                        if repair {
-                            prepare(&state);
+                        let status = service::request(Request::Status);
+                        if let Ok(mut live) = state.lock() {
+                            // Polling may recover readiness, but must never
+                            // launch an installer or repeat an elevation prompt.
+                            live.observe_status(status);
                         }
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
@@ -175,7 +200,9 @@ impl Controller {
         let Ok(mut live) = self.live.lock() else {
             return false;
         };
-        if live.busy
+        let queue_cancel =
+            pending == Some(Phase::Stopping) && live.phase() == Some(Phase::Connecting);
+        if (live.busy && !queue_cancel)
             || live.quitting
             || (pending == Some(Phase::Connecting) && !live.can_connect())
             || (pending == Some(Phase::Stopping) && !live.can_disconnect())
@@ -185,7 +212,14 @@ impl Controller {
         live.busy = true;
         live.pending = pending;
         live.notice = None;
-        if self.commands.send(Command::Action(Box::new(work))).is_err() {
+        if self
+            .commands
+            .send(Command::Action {
+                pending,
+                work: Box::new(work),
+            })
+            .is_err()
+        {
             live.busy = false;
             live.pending = None;
             live.notice = Some("后台任务已停止，请重新打开应用".into());
@@ -296,15 +330,18 @@ fn ensure_service(
         }
     }
     install()?;
+    let mut last_error = anyhow::anyhow!("后台未返回状态");
     for _ in 0..WAIT_ATTEMPTS {
-        if let Ok(status) = request(Request::Status)
-            && current_version(&status)
-        {
-            return Ok(status);
+        match request(Request::Status) {
+            Ok(status) if current_version(&status) => return Ok(status),
+            Ok(status) => {
+                last_error = anyhow::anyhow!("后台版本不匹配：{}", status.version);
+            }
+            Err(error) => last_error = error,
         }
         sleep();
     }
-    bail!("后台启动超时，请重试；若问题持续，请重新打开应用");
+    Err(last_error).context("后台启动超时，请重试；若问题持续，请重新打开应用")
 }
 
 #[cfg(test)]
@@ -318,6 +355,86 @@ mod tests {
         }
     }
     #[test]
+    fn polling_outages_never_restart_preparation() {
+        let mut live = Live {
+            readiness: Readiness::Ready,
+            status: Some(Status::default()),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            live.observe_status(Err(anyhow::anyhow!("broken pipe")));
+            assert_eq!(live.readiness, Readiness::Failed);
+            assert!(!live.can_connect());
+            assert!(!live.loading());
+            assert!(live.notice.as_ref().unwrap().contains("broken pipe"));
+            live.observe_status(Err(anyhow::anyhow!("offline")));
+            assert_eq!(live.readiness, Readiness::Failed);
+            assert!(live.notice.as_ref().unwrap().contains("broken pipe"));
+            live.observe_status(Ok(Status::default()));
+            assert_eq!(live.readiness, Readiness::Ready);
+            assert!(live.can_connect());
+            assert!(live.notice.is_none());
+        }
+    }
+    #[test]
+    fn polling_version_change_requires_manual_retry() {
+        let mut live = Live {
+            readiness: Readiness::Ready,
+            ..Default::default()
+        };
+        live.observe_status(Ok(status(Phase::Disconnected, "0.0.1")));
+        assert_eq!(live.readiness, Readiness::Failed);
+        assert!(live.notice.as_ref().unwrap().contains("0.0.1"));
+        assert!(!live.can_connect());
+    }
+    #[test]
+    fn polling_preserves_authorization_failure_until_manual_retry() {
+        let (commands, receiver) = mpsc::channel();
+        let controller = Controller {
+            live: Arc::new(Mutex::new(Live {
+                readiness: Readiness::Failed,
+                notice: Some("管理员授权被取消".into()),
+                ..Default::default()
+            })),
+            commands,
+        };
+        {
+            let mut live = controller.live.lock().unwrap();
+            live.observe_status(Err(anyhow::anyhow!("offline")));
+            assert_eq!(live.readiness, Readiness::Failed);
+            assert_eq!(live.notice.as_deref(), Some("管理员授权被取消"));
+            assert!(receiver.try_recv().is_err());
+        }
+        controller.retry();
+        controller.retry();
+        assert!(matches!(receiver.try_recv(), Ok(Command::Prepare)));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            controller.live.lock().unwrap().readiness,
+            Readiness::Preparing
+        );
+    }
+    #[test]
+    fn startup_timeout_retains_the_broker_error_and_installs_only_once() {
+        use std::cell::Cell;
+        let installs = Cell::new(0);
+        let error = ensure_service(
+            &mut |_| Err(anyhow::anyhow!("broken pipe").context("status handshake failed")),
+            || {
+                installs.set(installs.get() + 1);
+                Ok(())
+            },
+            &mut || {},
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(installs.get(), 1);
+        let message = format!("{error:#}");
+        assert!(message.contains("后台启动超时"));
+        assert!(message.contains("status handshake failed"));
+        assert!(message.contains("broken pipe"));
+    }
+    #[test]
     fn connection_controls_follow_worker_phase_after_request_finishes() {
         let mut live = Live {
             readiness: Readiness::Ready,
@@ -329,6 +446,8 @@ mod tests {
         live.busy = true;
         assert!(live.loading());
         assert!(!live.can_connect());
+        assert!(live.can_disconnect());
+        assert_eq!(live.connect_label(), "取消连接");
         live.pending = None;
         live.busy = false;
         for phase in [Phase::Connecting, Phase::Connected, Phase::Stopping] {
@@ -362,7 +481,7 @@ mod tests {
             controller.live.lock().unwrap().phase(),
             Some(Phase::Connecting)
         );
-        assert!(matches!(receiver.try_recv(), Ok(Command::Action(_))));
+        assert!(matches!(receiver.try_recv(), Ok(Command::Action { .. })));
         assert!(receiver.try_recv().is_err());
         let mut live = controller.live.lock().unwrap();
         live.pending = None;
@@ -370,6 +489,51 @@ mod tests {
         live.status.as_mut().unwrap().phase = Phase::Connected;
         drop(live);
         assert!(!controller.connect(|| panic!("already connected")));
+    }
+    #[test]
+    fn cancel_queues_while_connect_is_pending_and_survives_its_completion() {
+        let (commands, receiver) = mpsc::channel();
+        let controller = Controller {
+            live: Arc::new(Mutex::new(Live {
+                readiness: Readiness::Ready,
+                status: Some(Status::default()),
+                ..Default::default()
+            })),
+            commands,
+        };
+        assert!(controller.connect(|| Ok(())));
+        controller.disconnect();
+        controller.disconnect();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Command::Action {
+                pending: Some(Phase::Connecting),
+                ..
+            })
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Command::Action {
+                pending: Some(Phase::Stopping),
+                ..
+            })
+        ));
+        assert!(receiver.try_recv().is_err());
+        let mut live = controller.live.lock().unwrap();
+        live.finish_action(
+            Some(Phase::Connecting),
+            Err(anyhow::anyhow!("connection cancelled")),
+            Some(status(Phase::Connecting, env!("CARGO_PKG_VERSION"))),
+        );
+        assert_eq!(live.phase(), Some(Phase::Stopping));
+        assert!(live.busy);
+        assert!(!live.can_connect());
+        assert!(!live.can_disconnect());
+        assert!(live.notice.is_none());
+        live.finish_action(Some(Phase::Stopping), Ok(()), Some(Status::default()));
+        assert_eq!(live.phase(), Some(Phase::Disconnected));
+        assert!(!live.busy);
+        assert!(live.can_connect());
     }
     #[test]
     fn installer_success_is_not_readiness_until_matching_service_responds() {

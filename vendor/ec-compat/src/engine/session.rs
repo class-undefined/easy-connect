@@ -3,6 +3,7 @@ use crate::config::{GatewayConfiguration, parse_gateway_configuration};
 use crate::engine::data_plane::EasyConnectDataPlane;
 use crate::modern::{ModernSessionId, parse_sha256_pin, request_modern_token_with_pin};
 use crate::probe::{DEFAULT_TIMEOUT_SECONDS, GatewaySession};
+use crate::session_status::{SessionStatus, SessionStatusQuery};
 use crate::xml::{first_descendant_text, parse_xml};
 use crate::{Error, Result};
 use reqwest::Method;
@@ -25,6 +26,7 @@ pub struct AuthenticatedEngineSession {
     resource_path: String,
     gateway_configuration: GatewayConfiguration,
     configured_certificate_pin: Option<[u8; 32]>,
+    status_query: SessionStatusQuery,
 }
 
 impl AuthenticatedEngineSession {
@@ -47,7 +49,8 @@ impl AuthenticatedEngineSession {
             .as_str()
             .map(parse_sha256_pin)
             .transpose()?;
-        let (http, login) = authenticate_http(config, username, password)?;
+        let (http, login, modulus, exponent) =
+            authenticate_http_with_key(config, username, password)?;
         let login_summary = auth_summary(&login, "engine password login")?;
         if login_summary.state != AuthState::Authenticated {
             return Err(Error(format!(
@@ -70,6 +73,12 @@ impl AuthenticatedEngineSession {
             }
         }
         let modern_session = ModernSessionId::from_login_xml(&login)?;
+        let login_document = parse_xml(&login, "session monitor login")?;
+        let session_id = Zeroizing::new(first_descendant_text(
+            login_document.root_element(),
+            "TwfID",
+        ));
+        let status_query = SessionStatusQuery::new(session_id, modulus, exponent);
         let resource_path = required_endpoint(config, "resource_list")?.to_owned();
         let http = pending
             .http
@@ -105,6 +114,7 @@ impl AuthenticatedEngineSession {
             resource_path,
             gateway_configuration,
             configured_certificate_pin,
+            status_query,
         })
     }
 
@@ -138,9 +148,21 @@ impl AuthenticatedEngineSession {
             .collect()
     }
 
+    /// Reuse the authenticated cookie jar and RSA context; never logs in again.
+    pub fn session_status(&self) -> Result<SessionStatus> {
+        self.status_query.query(|stage, path| {
+            self.http
+                .get_once_with_timeout(stage, path, self.timeout.min(Duration::from_secs(3)))
+        })
+    }
+
     pub fn logout(self) -> Result<()> {
         self.http
-            .request("logout", &self.logout_path, Method::GET, None)
+            .get_once_with_timeout(
+                "logout",
+                &self.logout_path,
+                self.timeout.min(Duration::from_secs(3)),
+            )
             .map(|_| ())
     }
 }
@@ -180,6 +202,14 @@ pub(crate) fn authenticate_http(
     username: &str,
     password: &str,
 ) -> Result<(GatewaySession, Zeroizing<Vec<u8>>)> {
+    authenticate_http_with_key(config, username, password).map(|(http, login, _, _)| (http, login))
+}
+
+fn authenticate_http_with_key(
+    config: &Value,
+    username: &str,
+    password: &str,
+) -> Result<(GatewaySession, Zeroizing<Vec<u8>>, Zeroizing<String>, u64)> {
     let base_url = required_text(config, "base_url")?;
     let parsed_url =
         Url::parse(base_url).map_err(|_| Error("engine base URL is invalid".into()))?;
@@ -249,5 +279,5 @@ pub(crate) fn authenticate_http(
     form.values_mut().for_each(Zeroize::zeroize);
     let (login, _, _) = login_result?;
     let login = Zeroizing::new(login);
-    Ok((http, login))
+    Ok((http, login, modulus, exponent as u64))
 }

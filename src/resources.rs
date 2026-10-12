@@ -10,6 +10,13 @@ use std::{
 };
 use url::Url;
 
+mod catalog;
+pub use catalog::ResourceCatalog;
+#[cfg(feature = "desktop")]
+pub use catalog::ResourceEntry;
+#[cfg(all(feature = "desktop", test))]
+pub use catalog::ResourceGroup;
+
 pub struct PublishedResources {
     pub domains: BTreeSet<String>,
     pub cidrs: BTreeSet<String>,

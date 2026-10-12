@@ -32,13 +32,13 @@ cat > "$app/Contents/Info.plist" <<EOF
 </dict></plist>
 EOF
 identity="${MACOS_SIGNING_IDENTITY:-16CA7F918F2452512BEC526ECFF8561349493198}"
-keychain_args=()
+signing_args=(--force --sign "$identity")
 if [ -n "${MACOS_SIGNING_KEYCHAIN:-}" ]; then
-  keychain_args=(--keychain "$MACOS_SIGNING_KEYCHAIN")
+  signing_args+=(--keychain "$MACOS_SIGNING_KEYCHAIN")
 fi
-codesign --force --sign "$identity" "${keychain_args[@]}" "$app/Contents/MacOS/easy-connect"
-codesign --force --sign "$identity" "${keychain_args[@]}" "$app/Contents/MacOS/easy-connect-gui"
-codesign --force --sign "$identity" "${keychain_args[@]}" "$app"
+codesign "${signing_args[@]}" "$app/Contents/MacOS/easy-connect"
+codesign "${signing_args[@]}" "$app/Contents/MacOS/easy-connect-gui"
+codesign "${signing_args[@]}" "$app"
 codesign --display --verbose=2 "$app"
 codesign --verify --deep --strict "$app"
 ln -sfn /Applications "$stage/Applications"

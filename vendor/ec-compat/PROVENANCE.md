@@ -72,3 +72,17 @@ packaged application's `legal/electron/` directory as described in
 ## easy-connect password policy compatibility (2026-10-12)
 
 The added `src/password.rs` and the authentication-session refactor were informed by protocol review of the installed Sangfor EasyConnect 7.6.7.10 Web SDK (`common/dto.js`, `api/person_setting.js`, `business/user_settings.js`, `local/connect/connect.js`) and gateway-served password-change pages. No official JavaScript is redistributed. Endpoint names, response fields and policy bit semantics are documented in the root project's `docs/password-policy.md`; synthetic protocol tests do not change a real account password.
+
+## easy-connect session status compatibility (2026-10-12)
+
+The added `src/session_status.rs` and session-monitor integration were informed
+by static review of the installed Sangfor EasyConnect application (bundle
+version 7.6.7, build 6). The reviewed Web SDK files were `jssdk/api/res.js`,
+`jssdk/common/common.js`, `jssdk/common/config.js`, `libs/rsa.js`, and
+`local/vpn_logout_passive/vpn_logout_passive.js`. REA application Evidence
+`ev_2c181ab954ce31bbed76e54f766001c78a4efc12b655623e45989a59afb281f1`
+and feature traces establish static protocol/UI relationships, not runtime
+verification against every gateway. The implementation uses the observed
+`timequery.csp`, `randtick.csp`, and `getlogoutinfo.csp` sequence, encrypted
+session/nonce format, and named logout reasons. Tests use synthetic responses
+and ephemeral RSA keys; no official JavaScript or session data is redistributed.

@@ -12,6 +12,7 @@ use ec_compat::engine::session::AuthenticatedEngineSession;
 use ec_compat::engine::socks::SocksServer;
 use ec_compat::modern::{parse_sha256_pin, probe_special_tls_contract};
 use ec_compat::probe::{GatewaySession, read_credentials};
+use ec_compat::session_status::{SessionEndReason, SessionStatus};
 use ec_compat::xml::{first_descendant_text, parse_xml};
 use serde_json::{Value, json};
 use std::{
@@ -392,8 +393,20 @@ async fn connect(
     let mtu = config["tunnel"]["mtu"].as_u64().context("missing mtu")? as usize;
     let service_config = config.clone();
     // reqwest's blocking client must be created, used, and dropped outside Tokio workers.
-    let (session, published, policy) = tokio::task::spawn_blocking(move || -> Result<_> {
-        let session = AuthenticatedEngineSession::authenticate(&config, &username, &password)?;
+    let prepared = tokio::task::spawn_blocking(move || -> Result<_> {
+        if connection_cancelled() {
+            return Ok(None);
+        }
+        let session = match AuthenticatedEngineSession::authenticate(&config, &username, &password)
+        {
+            Ok(session) => session,
+            Err(_) if connection_cancelled() => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if connection_cancelled() {
+            let _ = session.logout();
+            return Ok(None);
+        }
         if let Some(policy) = session.password_policy() {
             eprintln!("{} {}", policy.message(), policy.marker());
         }
@@ -404,20 +417,34 @@ async fn connect(
             Ok((published, Arc::new(policy)))
         })();
         match result {
-            Ok((published, policy)) => Ok((session, published, policy)),
+            Ok((published, policy)) => Ok(Some((session, published, policy))),
             Err(error) => {
                 let _ = session.logout();
-                Err(error)
+                if connection_cancelled() {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
             }
         }
     })
     .await??;
+    let Some((session, published, policy)) = prepared else {
+        return Ok(());
+    };
     println!(
         "Loaded {} published resources, {} groups; default resource: {}",
         published.entries.len(),
         published.groups.len(),
         published.default_resource
     );
+    if crate::service::CONTROLLED.load(std::sync::atomic::Ordering::Relaxed)
+        && let Err(error) = crate::resources::ResourceCatalog::from_published(&published)
+            .write_events(std::io::stdout().lock())
+    {
+        let _ = tokio::task::spawn_blocking(move || session.logout()).await;
+        return Err(error.into());
+    }
     if published.skipped_hosts > 0 {
         eprintln!(
             "{} resource hosts had unsupported formats and were omitted from automatic routes",
@@ -431,21 +458,39 @@ async fn connect(
     if dns.is_empty() {
         dns = configured_dns;
     }
-    let (session, plane) =
-        tokio::task::spawn_blocking(move || match session.establish_data_plane() {
-            Ok(plane) => Ok((session, plane)),
+    let established = tokio::task::spawn_blocking(move || {
+        if connection_cancelled() {
+            let _ = session.logout();
+            return Ok(None);
+        }
+        match session.establish_data_plane() {
+            Ok(plane) if connection_cancelled() => {
+                drop(plane);
+                let _ = session.logout();
+                Ok(None)
+            }
+            Ok(plane) => Ok(Some((session, plane))),
             Err(error) => {
+                if connection_cancelled() {
+                    let _ = session.logout();
+                    return Ok(None);
+                }
                 if session.logout().is_err() {
                     eprintln!("logout after tunnel failure did not complete");
                 }
                 Err(error)
             }
-        })
-        .await??;
-    let service_result = if mode == ConnectMode::Tun {
-        tun::run(plane, published, policy, service_config, dns, mtu).await
-    } else {
-        async {
+        }
+    })
+    .await??;
+    let Some((session, plane)) = established else {
+        return Ok(());
+    };
+    let service = async {
+        if mode == ConnectMode::Tun {
+            tun::run(plane, published, policy, service_config, dns, mtu).await
+        } else {
+            async {
         let stack = Arc::new(VirtualNetstack::start(plane, mtu)?);
         let fallback: Arc<dyn NameResolver> = if dns.is_empty() {
             eprintln!("No VPN DNS supplied. Gateway static DNS records and IP targets work; configure proxy.vpn_dns_servers for other domain targets.");
@@ -463,12 +508,118 @@ async fn connect(
             _ = unhealthy => { bail!("VPN data channel disconnected; reconnect by rerunning connect"); }
         }
     }.await
+        }
     };
-    let logout = tokio::task::spawn_blocking(move || session.logout()).await?;
+    let (finish, finished) = tokio::sync::oneshot::channel();
+    let monitor = monitor_session(
+        session,
+        |session: AuthenticatedEngineSession| async move {
+            tokio::task::spawn_blocking(move || {
+                let status = session.session_status();
+                (session, status)
+            })
+            .await
+            .map_err(anyhow::Error::from)
+        },
+        finished,
+        Duration::from_secs(10),
+    );
+    tokio::pin!(service, monitor);
+    let (service_result, session, reason) = tokio::select! {
+        // Manual cancellation wins if the service and monitor finish together.
+        biased;
+        result = &mut service => {
+            let cancelled = result.is_ok() || connection_cancelled();
+            let _ = finish.send(!cancelled);
+            let (session, reason) = monitor.await?;
+            let cancelled = cancelled || connection_cancelled();
+            (if cancelled { Ok(()) } else { result }, session, if cancelled { None } else { reason })
+        },
+        monitored = &mut monitor => {
+            let cancelled = connection_cancelled();
+            // Do not drop tun::run: allow DNS/routes and all packet workers to
+            // clean up through its existing cooperative shutdown path.
+            crate::service::STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+            let result = service.await;
+            let (session, reason) = monitored?;
+            (if cancelled { Ok(()) } else { result }, session, if cancelled { None } else { reason })
+        },
+    };
+    if let Some(reason) = reason {
+        eprintln!("{}", reason.marker());
+    }
+    // A confirmed remote logout needs no second logout request. In particular,
+    // don't interfere with the replacement session after a private kick.
+    let logout = tokio::task::spawn_blocking(move || {
+        if reason.is_some_and(|reason| reason != SessionEndReason::ConnectionLost) {
+            drop(session);
+            Ok(())
+        } else {
+            session.logout()
+        }
+    })
+    .await?;
     if logout.is_err() {
         eprintln!("logout did not complete; the gateway may retain the session until timeout");
     }
+    if let Some(reason) = reason {
+        bail!(reason.message());
+    }
     service_result
+}
+
+fn connection_cancelled() -> bool {
+    crate::service::STOP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The state stays on a blocking worker during each HTTPS request. We always
+/// await that worker (including on cancellation) so reqwest is never dropped
+/// on an async runtime thread and no authenticated session is abandoned.
+async fn monitor_session<S, F, Fut>(
+    mut session: S,
+    mut query: F,
+    mut finished: tokio::sync::oneshot::Receiver<bool>,
+    interval: Duration,
+) -> Result<(S, Option<SessionEndReason>)>
+where
+    F: FnMut(S) -> Fut,
+    Fut: std::future::Future<Output = Result<(S, ec_compat::Result<SessionStatus>)>>,
+{
+    let mut failures = 0;
+    loop {
+        let mut final_query = tokio::select! {
+            biased;
+            command = &mut finished => {
+                if command != Ok(true) { return Ok((session, None)); }
+                true
+            },
+            _ = tokio::time::sleep(interval) => false,
+        };
+        let (returned, status) = query(session).await?;
+        session = returned;
+        if !final_query {
+            match finished.try_recv() {
+                Ok(false) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    return Ok((session, None));
+                }
+                Ok(true) => final_query = true,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
+        match status {
+            Ok(SessionStatus::Ended(reason)) => return Ok((session, Some(reason))),
+            Ok(SessionStatus::Online) if !final_query => failures = 0,
+            Err(_) if !final_query => {
+                failures += 1;
+                if failures >= 3 {
+                    return Ok((session, Some(SessionEndReason::ConnectionLost)));
+                }
+            }
+            // A broken data channel with an online/unknown control session is
+            // a connectivity failure, never evidence of a private kick.
+            _ => return Ok((session, Some(SessionEndReason::ConnectionLost))),
+        }
+    }
 }
 
 pub(crate) async fn shutdown_signal() -> Result<()> {
@@ -661,6 +812,112 @@ async fn connect_brokered(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn session_monitor_cancellation_never_queries_or_reports_a_failure() {
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        finish.send(false).unwrap();
+        let (_, reason) = monitor_session(
+            (),
+            |_| async {
+                panic!("manual cancellation must not query the gateway");
+                #[allow(unreachable_code)]
+                Ok(((), Ok(SessionStatus::Online)))
+            },
+            finished,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reason, None);
+    }
+
+    #[tokio::test]
+    async fn session_monitor_manual_cancel_during_query_suppresses_kick() {
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let mut finish = Some(finish);
+        let (_, reason) = monitor_session(
+            (),
+            |_| {
+                finish.take().unwrap().send(false).unwrap();
+                async { Ok(((), Ok(SessionStatus::Ended(SessionEndReason::PrivateKick)))) }
+            },
+            finished,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reason, None);
+    }
+
+    #[tokio::test]
+    async fn broken_channel_checks_reason_and_never_assumes_private_kick() {
+        for (status, expected) in [
+            (SessionStatus::Online, SessionEndReason::ConnectionLost),
+            (
+                SessionStatus::Ended(SessionEndReason::PrivateKick),
+                SessionEndReason::PrivateKick,
+            ),
+            (
+                SessionStatus::Ended(SessionEndReason::Unknown),
+                SessionEndReason::Unknown,
+            ),
+        ] {
+            let (finish, finished) = tokio::sync::oneshot::channel();
+            finish.send(true).unwrap();
+            let (calls, reason) = monitor_session(
+                0,
+                |calls| async move { Ok((calls + 1, Ok(status))) },
+                finished,
+                Duration::from_secs(3600),
+            )
+            .await
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(reason, Some(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_tolerates_transient_failures_and_resets_after_success() {
+        let (_finish, finished) = tokio::sync::oneshot::channel();
+        let responses = [
+            Err(ec_compat::Error("network".into())),
+            Ok(SessionStatus::Online),
+            Err(ec_compat::Error("network".into())),
+            Err(ec_compat::Error("network".into())),
+            Ok(SessionStatus::Ended(SessionEndReason::AdminKick)),
+        ];
+        let mut responses = responses.into_iter();
+        let (calls, reason) = monitor_session(
+            0,
+            |calls| {
+                let response = responses.next().expect("monitor should stop once ended");
+                async move { Ok((calls + 1, response)) }
+            },
+            finished,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls, 5);
+        assert_eq!(reason, Some(SessionEndReason::AdminKick));
+    }
+
+    #[tokio::test]
+    async fn repeated_status_errors_report_connection_loss() {
+        let (_finish, finished) = tokio::sync::oneshot::channel();
+        let (calls, reason) = monitor_session(
+            0,
+            |calls| async move { Ok((calls + 1, Err(ec_compat::Error("network".into())))) },
+            finished,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(reason, Some(SessionEndReason::ConnectionLost));
+    }
+
     #[test]
     fn url_only_uses_defaults_and_binds_known_pin_to_exact_gateway() {
         let known = profile("https://166.111.77.32:4430/", None).unwrap();

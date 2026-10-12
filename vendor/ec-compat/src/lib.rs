@@ -7,6 +7,7 @@ pub mod modern;
 pub mod password;
 pub mod probe;
 pub mod protocol_map;
+pub mod session_status;
 pub mod special_tls11;
 pub mod trust;
 pub mod tunnel;

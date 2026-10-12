@@ -208,8 +208,34 @@ impl GatewaySession {
         method: reqwest::Method,
         form: Option<&BTreeMap<String, String>>,
     ) -> Result<(Vec<u8>, BTreeMap<String, String>, u16)> {
+        self.request_with_timeout(stage, path, method, form, None)
+    }
+
+    /// Short, non-retrying queries must not hold up tunnel cancellation.
+    pub(crate) fn get_once_with_timeout(
+        &self,
+        stage: &'static str,
+        path: &str,
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        self.request_with_timeout(stage, path, reqwest::Method::GET, None, Some(timeout))
+            .map(|(body, _, _)| body)
+    }
+
+    fn request_with_timeout(
+        &self,
+        stage: &'static str,
+        path: &str,
+        method: reqwest::Method,
+        form: Option<&BTreeMap<String, String>>,
+        timeout: Option<Duration>,
+    ) -> Result<(Vec<u8>, BTreeMap<String, String>, u16)> {
         let url = endpoint_url(&self.base_url, path)?;
-        let attempts = gateway_request_attempts(&method, form.is_some());
+        let attempts = if timeout.is_some() {
+            1
+        } else {
+            gateway_request_attempts(&method, form.is_some())
+        };
         let mut response = None;
         for attempt in 0..attempts {
             let mut request = self
@@ -217,6 +243,9 @@ impl GatewaySession {
                 .request(method.clone(), &url)
                 .header(USER_AGENT, &self.user_agent)
                 .header(ACCEPT, "application/xml,text/xml,*/*;q=0.1");
+            if let Some(timeout) = timeout {
+                request = request.timeout(timeout);
+            }
             if let Some(form) = form {
                 request = request
                     .header(CONTENT_TYPE, "application/x-www-form-urlencoded")

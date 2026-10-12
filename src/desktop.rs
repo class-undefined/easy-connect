@@ -28,6 +28,7 @@ use zeroize::Zeroizing;
 
 mod controller;
 mod password;
+mod resources;
 mod updates;
 use controller::{Controller, Live, Readiness};
 use updates::UpdateState;
@@ -438,6 +439,7 @@ impl Desktop {
                 if self.auto_login
                     && self.remember
                     && status.phase == Phase::Disconnected
+                    && status.session_end.is_none()
                     && !self.username.read(cx).value().is_empty()
                     && !self.password.read(cx).value().is_empty()
                 {
@@ -801,10 +803,22 @@ impl Render for Desktop {
             .as_ref()
             .map(|s| s.connect_label())
             .unwrap_or("正在准备…");
-        let loading = live.as_ref().is_some_and(|s| s.loading());
+        // gpui-component disables click handlers on loading buttons. Keep the
+        // connecting action clickable so the same button can cancel it.
+        let loading =
+            live.as_ref().is_some_and(|s| s.loading()) && phase != Some(Phase::Connecting);
         let notice = live.as_ref().and_then(|s| s.notice.clone());
         drop(live);
-        let (state, color) = phase_style(phase);
+        let session_end = status
+            .as_ref()
+            .filter(|_| !matches!(phase, Some(Phase::Connecting | Phase::Stopping)))
+            .and_then(|s| s.session_end.as_ref());
+        let show_resources = status.as_ref().is_some_and(resources::visible);
+        let (state, color) = if session_end.is_some() {
+            ("连接已结束", 0xe1ad68)
+        } else {
+            phase_style(phase)
+        };
         let update = self.updates.lock().map(|s| s.clone()).unwrap_or_default();
         let update_label = match &update {
             UpdateState::Available { version, .. } => format!("下载 v{version}"),
@@ -855,70 +869,128 @@ impl Render for Desktop {
             )
             .child(
                 div()
-                    .id("connection-form")
+                    .id(if show_resources {
+                        "resource-content"
+                    } else if session_end.is_some() {
+                        "session-ended-content"
+                    } else {
+                        "connection-content"
+                    })
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
                     .p(px(16.))
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .flex_col()
-                            .gap(px(12.))
-                            .child(field("网关 URL", &self.gateway))
-                            .child(field("账号", &self.username))
-                            .child(field("密码", &self.password))
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap(px(22.))
-                                    .child(toggle("remember", "记住密码", self.remember).on_click(
-                                        cx.listener(|view, _, _, cx| {
-                                            if view
-                                                .controller
-                                                .live
-                                                .lock()
-                                                .ok()
-                                                .is_some_and(|s| s.busy)
-                                            {
-                                                return;
-                                            }
-                                            view.remember = !view.remember;
-                                            if !view.remember {
-                                                view.auto_login = false;
-                                                view.startup_pending = false;
-                                            }
-                                            view.persist(cx);
-                                            cx.notify();
-                                        }),
-                                    ))
-                                    .child(
-                                        toggle("auto-login", "启动时自动登录", self.auto_login)
-                                            .on_click(cx.listener(|view, _, _, cx| {
-                                                if view
-                                                    .controller
-                                                    .live
-                                                    .lock()
-                                                    .ok()
-                                                    .is_some_and(|s| s.busy)
-                                                {
-                                                    return;
-                                                }
-                                                view.auto_login = !view.auto_login;
-                                                if view.auto_login {
-                                                    view.remember = true;
-                                                }
-                                                view.persist(cx);
-                                                cx.notify();
-                                            })),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap(px(8.))
-                                    .child(
+                    .when_some(session_end, |s, reason| {
+                        s.child(
+                            div()
+                                .id("session-ended")
+                                .mb(px(12.))
+                                .p(px(10.))
+                                .border_1()
+                                .border_color(rgb(0x725734))
+                                .bg(rgb(0x30271e))
+                                .text_color(rgb(0xe1ad68))
+                                .child(reason.message()),
+                        )
+                    })
+                    .when(show_resources, |s| {
+                        s.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(14.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .text_size(px(16.))
+                                                .font_weight(FontWeight::BOLD)
+                                                .child("可用资源"),
+                                        )
+                                        .child(
+                                            Button::new("disconnect")
+                                                .label(if phase == Some(Phase::Stopping) {
+                                                    "正在断开…"
+                                                } else {
+                                                    "断开连接"
+                                                })
+                                                .rounded_none()
+                                                .disabled(!can_disconnect)
+                                                .on_click(cx.listener(|view, _, _, cx| {
+                                                    view.startup_pending = false;
+                                                    view.controller.disconnect();
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                )
+                                .child(resources::catalog(
+                                    &status.as_ref().expect("connected status").resource_catalog,
+                                )),
+                        )
+                    })
+                    .when(!show_resources, |s| {
+                        s.child(
+                            div()
+                                .id("connection-form")
+                                .w_full()
+                                .flex()
+                                .flex_col()
+                                .gap(px(12.))
+                                .child(field("网关 URL", &self.gateway))
+                                .child(field("账号", &self.username))
+                                .child(field("密码", &self.password))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap(px(22.))
+                                        .child(
+                                            toggle("remember", "记住密码", self.remember).on_click(
+                                                cx.listener(|view, _, _, cx| {
+                                                    if view
+                                                        .controller
+                                                        .live
+                                                        .lock()
+                                                        .ok()
+                                                        .is_some_and(|s| s.busy)
+                                                    {
+                                                        return;
+                                                    }
+                                                    view.remember = !view.remember;
+                                                    if !view.remember {
+                                                        view.auto_login = false;
+                                                        view.startup_pending = false;
+                                                    }
+                                                    view.persist(cx);
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            toggle("auto-login", "启动时自动登录", self.auto_login)
+                                                .on_click(cx.listener(|view, _, _, cx| {
+                                                    if view
+                                                        .controller
+                                                        .live
+                                                        .lock()
+                                                        .ok()
+                                                        .is_some_and(|s| s.busy)
+                                                    {
+                                                        return;
+                                                    }
+                                                    view.auto_login = !view.auto_login;
+                                                    if view.auto_login {
+                                                        view.remember = true;
+                                                    }
+                                                    view.persist(cx);
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    div().flex().gap(px(8.)).child(
                                         Button::new("connect")
                                             .label(connect_label)
                                             .primary()
@@ -926,140 +998,121 @@ impl Render for Desktop {
                                             .h(px(36.))
                                             .flex_1()
                                             .loading(loading)
-                                            .disabled(!can_connect)
+                                            .disabled(!can_connect && !can_disconnect)
                                             .on_click(cx.listener(|view, _, window, cx| {
                                                 view.startup_pending = false;
-                                                view.connect(window, cx);
-                                            })),
-                                    )
-                                    .when(
-                                        matches!(
-                                            phase,
-                                            Some(
-                                                Phase::Connecting
-                                                    | Phase::Connected
-                                                    | Phase::Stopping
-                                            )
-                                        ),
-                                        |s| {
-                                            s.child(
-                                                Button::new("disconnect")
-                                                    .label(if phase == Some(Phase::Connecting) {
-                                                        "取消连接"
-                                                    } else {
-                                                        "断开连接"
-                                                    })
-                                                    .rounded_none()
-                                                    .h(px(36.))
-                                                    .disabled(!can_disconnect)
-                                                    .on_click(cx.listener(|view, _, _, cx| {
-                                                        view.startup_pending = false;
-                                                        view.controller.disconnect();
-                                                        cx.notify();
-                                                    })),
-                                            )
-                                        },
-                                    ),
-                            )
-                            .when_some(policy, |s, policy| {
-                                s.child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(8.))
-                                        .text_color(rgb(0xe1ad68))
-                                        .child(policy.message())
-                                        .child(
-                                            button("change-password", "修改密码", true).on_click(
-                                                cx.listener(|view, _, _, cx| {
-                                                    view.open_password(cx)
-                                                }),
-                                            ),
-                                        ),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(
-                                        toggle("auto-update", "自动检查更新", self.auto_update)
-                                            .on_click(cx.listener(|view, _, _, cx| {
-                                                if view
+                                                let can_disconnect = view
                                                     .controller
                                                     .live
                                                     .lock()
-                                                    .ok()
-                                                    .is_some_and(|s| s.busy)
-                                                {
-                                                    return;
+                                                    .is_ok_and(|s| s.can_disconnect());
+                                                if can_disconnect {
+                                                    view.controller.disconnect();
+                                                    cx.notify();
+                                                } else {
+                                                    view.connect(window, cx);
                                                 }
-                                                view.auto_update = !view.auto_update;
-                                                if view.auto_update {
-                                                    updates::check(view.updates.clone());
-                                                }
-                                                view.persist(cx);
-                                                cx.notify();
                                             })),
-                                    )
-                                    .child(
-                                        button(
-                                            "advanced",
-                                            if self.advanced {
-                                                "收起高级设置"
-                                            } else {
-                                                "高级设置"
-                                            },
-                                            false,
-                                        )
-                                        .on_click(
-                                            cx.listener(|view, _, _, cx| {
-                                                view.advanced = !view.advanced;
-                                                cx.notify();
-                                            }),
-                                        ),
                                     ),
-                            )
-                            .when(self.advanced, |s| {
-                                s.child(
+                                )
+                                .when_some(policy, |s, policy| {
+                                    s.child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(8.))
+                                            .text_color(rgb(0xe1ad68))
+                                            .child(policy.message())
+                                            .child(
+                                                button("change-password", "修改密码", true)
+                                                    .on_click(cx.listener(|view, _, _, cx| {
+                                                        view.open_password(cx)
+                                                    })),
+                                            ),
+                                    )
+                                })
+                                .child(
                                     div()
                                         .flex()
-                                        .flex_col()
-                                        .gap(px(12.))
-                                        .border_t_1()
-                                        .border_color(rgb(0x303e4e))
-                                        .pt(px(12.))
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            toggle("auto-update", "自动检查更新", self.auto_update)
+                                                .on_click(cx.listener(|view, _, _, cx| {
+                                                    if view
+                                                        .controller
+                                                        .live
+                                                        .lock()
+                                                        .ok()
+                                                        .is_some_and(|s| s.busy)
+                                                    {
+                                                        return;
+                                                    }
+                                                    view.auto_update = !view.auto_update;
+                                                    if view.auto_update {
+                                                        updates::check(view.updates.clone());
+                                                    }
+                                                    view.persist(cx);
+                                                    cx.notify();
+                                                })),
+                                        )
                                         .child(
                                             button(
-                                                "manual-change-password",
-                                                "修改 VPN 密码",
+                                                "advanced",
+                                                if self.advanced {
+                                                    "收起高级设置"
+                                                } else {
+                                                    "高级设置"
+                                                },
                                                 false,
                                             )
                                             .on_click(
                                                 cx.listener(|view, _, _, cx| {
-                                                    view.open_password(cx)
+                                                    view.advanced = !view.advanced;
+                                                    cx.notify();
                                                 }),
-                                            ),
-                                        )
-                                        .child(
-                                            button("save-settings", "保存设置", false).on_click(
-                                                cx.listener(|view, _, _, cx| view.persist(cx)),
                                             ),
                                         ),
                                 )
-                            })
-                            .when_some(notice, |s, notice| {
-                                s.child(div().text_color(rgb(0xe1ad68)).child(notice))
-                            })
-                            .when(matches!(update, UpdateState::Failed(_)), |s| {
-                                if let UpdateState::Failed(message) = update {
-                                    s.child(div().text_color(rgb(0xe1ad68)).child(message))
-                                } else {
-                                    s
-                                }
-                            }),
-                    ),
+                                .when(self.advanced, |s| {
+                                    s.child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(12.))
+                                            .border_t_1()
+                                            .border_color(rgb(0x303e4e))
+                                            .pt(px(12.))
+                                            .child(
+                                                button(
+                                                    "manual-change-password",
+                                                    "修改 VPN 密码",
+                                                    false,
+                                                )
+                                                .on_click(cx.listener(|view, _, _, cx| {
+                                                    view.open_password(cx)
+                                                })),
+                                            )
+                                            .child(
+                                                button("save-settings", "保存设置", false)
+                                                    .on_click(cx.listener(|view, _, _, cx| {
+                                                        view.persist(cx)
+                                                    })),
+                                            ),
+                                    )
+                                }),
+                        )
+                    })
+                    .when_some(notice, |s, notice| {
+                        s.child(div().mt(px(12.)).text_color(rgb(0xe1ad68)).child(notice))
+                    })
+                    .when(matches!(update, UpdateState::Failed(_)), |s| {
+                        if let UpdateState::Failed(message) = update {
+                            s.child(div().mt(px(12.)).text_color(rgb(0xe1ad68)).child(message))
+                        } else {
+                            s
+                        }
+                    }),
             )
             .child(
                 div()
