@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 arch="${1:-aarch64}"
-version="${2:-0.2.0}"
+version="${2:-0.3.0}"
 target="$arch-apple-darwin"
 stage=".release-stage/macos-$arch"
 app="$stage/EasyConnect Rust.app"
@@ -31,8 +31,15 @@ cat > "$app/Contents/Info.plist" <<EOF
 <key>NSHumanReadableCopyright</key><string>© 野漫横江</string>
 </dict></plist>
 EOF
-codesign --force --sign - "$app/Contents/MacOS/easy-connect"
-codesign --force --deep --sign - "$app"
+identity="${MACOS_SIGNING_IDENTITY:-16CA7F918F2452512BEC526ECFF8561349493198}"
+keychain_args=()
+if [ -n "${MACOS_SIGNING_KEYCHAIN:-}" ]; then
+  keychain_args=(--keychain "$MACOS_SIGNING_KEYCHAIN")
+fi
+codesign --force --sign "$identity" "${keychain_args[@]}" "$app/Contents/MacOS/easy-connect"
+codesign --force --sign "$identity" "${keychain_args[@]}" "$app/Contents/MacOS/easy-connect-gui"
+codesign --force --sign "$identity" "${keychain_args[@]}" "$app"
+codesign --display --verbose=2 "$app"
 codesign --verify --deep --strict "$app"
-ln -s /Applications "$stage/Applications"
+ln -sfn /Applications "$stage/Applications"
 hdiutil create -volname "EasyConnect Rust $version" -srcfolder "$stage" -ov -format UDZO "dist/easy-connect-$version-macos-$arch.dmg"

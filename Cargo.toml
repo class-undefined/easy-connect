@@ -1,6 +1,6 @@
 [package]
 name = "easy-connect"
-version = "0.3.0"
+version = "0.4.0"
 authors = ["野漫横江 (class-undefined)"]
 edition = "2024"
 rust-version = "1.94"
