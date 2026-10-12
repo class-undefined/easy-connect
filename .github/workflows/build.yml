@@ -1,0 +1,105 @@
+name: Build and release
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            arch: aarch64
+            os: macos
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+            os: macos
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            arch: x86_64
+            os: windows
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            arch: aarch64
+            os: windows
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_TERM_COLOR: always
+      LZMA_API_STATIC: '1'
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.1'
+          targets: ${{ matrix.target }}
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-desktop
+      - name: Set up MSVC
+        if: matrix.os == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch == 'aarch64' && 'arm64' || 'x64' }}
+      - name: Locate Windows shader compiler
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/fxc.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw "Windows SDK fxc.exe missing" }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Test desktop and VPN logic
+        run: cargo test --locked --features desktop --lib --target ${{ matrix.target }}
+      - name: Clippy
+        run: cargo clippy --locked --features desktop --bins --target ${{ matrix.target }} -- -D warnings
+      - name: Build release executables
+        run: cargo build --locked --release --features desktop --bins --target ${{ matrix.target }}
+      - name: Collect dependency licenses
+        run: python scripts/collect-licenses.py
+      - name: Package macOS DMG
+        if: matrix.os == 'macos'
+        shell: bash
+        run: bash scripts/package-macos.sh '${{ matrix.arch }}' "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+      - name: Package Windows with signed Wintun driver
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $version = (Select-String '^version = "([^\"]+)"' Cargo.toml).Matches[0].Groups[1].Value
+          ./scripts/package-windows.ps1 -Arch '${{ matrix.arch }}' -Version $version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: easy-connect-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          sha256sum dist/* > dist/SHA256SUMS.txt
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --title "EasyConnect $RELEASE_TAG" --generate-notes
