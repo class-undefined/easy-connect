@@ -258,7 +258,15 @@ fn tray_icon(connected: bool) -> Result<tray_icon::Icon> {
                 || (connected && y >= 11 && (6..=11).contains(&x))
             {
                 let i = (y * 18 + x) * 4;
-                pixels[i..i + 4].copy_from_slice(&[20, 20, 20, 255]);
+                pixels[i..i + 4].copy_from_slice(if cfg!(windows) {
+                    if connected {
+                        &[34, 211, 176, 255]
+                    } else {
+                        &[130, 152, 174, 255]
+                    }
+                } else {
+                    &[20, 20, 20, 255]
+                });
             }
         }
     }

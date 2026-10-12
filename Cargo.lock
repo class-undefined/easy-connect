@@ -1833,6 +1833,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "hex",
+ "hmac",
  "keyring",
  "libc",
  "rand 0.8.7",

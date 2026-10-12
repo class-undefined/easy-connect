@@ -502,7 +502,7 @@ fn create_device(address: Ipv4Addr, mtu: usize) -> Result<tun_rs::AsyncDevice> {
                 "wintun.dll is missing beside easy-connect.exe; use the complete release package"
             );
         }
-        builder.name("EasyConnect").with(|b| {
+        builder.name("EasyConnectRust").with(|b| {
             b.wintun_file(dll.to_string_lossy().into_owned());
         })
     };

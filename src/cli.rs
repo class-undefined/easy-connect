@@ -244,6 +244,7 @@ fn credentials(
     controlled: bool,
 ) -> Result<(Zeroizing<String>, Zeroizing<String>)> {
     if controlled {
+        crate::service::CONTROLLED.store(true, std::sync::atomic::Ordering::Relaxed);
         use std::io::{BufRead, Read};
         let mut input = std::io::stdin().lock();
         let mut lines = Vec::new();
@@ -466,6 +467,10 @@ pub(crate) async fn shutdown_signal() -> Result<()> {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     };
+    if crate::service::CONTROLLED.load(std::sync::atomic::Ordering::Relaxed) {
+        stopped.await;
+        return Ok(());
+    }
     #[cfg(unix)]
     {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;

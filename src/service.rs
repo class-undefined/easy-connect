@@ -1,11 +1,16 @@
 //! Loopback broker. A per-user capability authenticates fixed VPN operations.
 use anyhow::{Context, Result, bail};
+use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+#[cfg(target_os = "windows")]
+use std::net::{TcpListener, TcpStream};
+#[cfg(target_os = "macos")]
+use std::os::unix::net::{UnixListener as TcpListener, UnixStream as TcpStream};
 use std::{
     collections::VecDeque,
     io::{BufRead, BufReader, Read, Write},
-    net::{TcpListener, TcpStream},
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
@@ -15,11 +20,37 @@ use std::{
     time::Duration,
 };
 use zeroize::{Zeroize, Zeroizing};
+#[cfg(target_os = "windows")]
 const PORT: u16 = 40571;
 const LIMIT: u64 = 16384;
 #[cfg(target_os = "windows")]
-const NAME: &str = "EasyConnect";
+const NAME: &str = "EasyConnectRust";
 pub(crate) static STOP: AtomicBool = AtomicBool::new(false);
+pub(crate) static CONTROLLED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "windows")]
+fn known_folder(id: &windows_sys::core::GUID) -> Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    let mut path = std::ptr::null_mut();
+    // SAFETY: valid GUID and output pointer. Windows allocates a NUL-terminated path.
+    let result = unsafe {
+        windows_sys::Win32::UI::Shell::SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut path)
+    };
+    if result < 0 || path.is_null() {
+        bail!("Windows known folder unavailable");
+    }
+    // SAFETY: SHGetKnownFolderPath guarantees a NUL-terminated allocation until freed.
+    let owned = unsafe {
+        let mut len = 0;
+        while *path.add(len) != 0 {
+            len += 1;
+        }
+        let value = std::ffi::OsString::from_wide(std::slice::from_raw_parts(path, len));
+        windows_sys::Win32::System::Com::CoTaskMemFree(path as _);
+        value
+    };
+    Ok(PathBuf::from(owned))
+}
 
 #[derive(Serialize, Deserialize)]
 pub enum Request {
@@ -40,14 +71,75 @@ impl Drop for Request {
     }
 }
 #[derive(Serialize, Deserialize)]
-struct Envelope {
-    token: String,
-    request: Request,
+struct Challenge {
+    nonce: String,
 }
-impl Drop for Envelope {
+#[derive(Serialize, Deserialize)]
+struct ServerProof {
+    nonce: String,
+    proof: String,
+}
+#[derive(Serialize, Deserialize)]
+struct Frame {
+    payload: String,
+    proof: String,
+}
+impl Drop for Frame {
     fn drop(&mut self) {
-        self.token.zeroize();
+        self.payload.zeroize();
     }
+}
+fn nonce() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+fn valid_nonce(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+fn mac(key: &[u8], role: &str, client: &str, server: &str, payload: &str) -> Hmac<Sha256> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts every key length");
+    for value in ["easy-connect-rpc-v1", role, client, server, payload] {
+        mac.update(value.as_bytes());
+        mac.update(&[0]);
+    }
+    mac
+}
+fn proof(key: &[u8], role: &str, client: &str, server: &str, payload: &str) -> String {
+    hex::encode(
+        mac(key, role, client, server, payload)
+            .finalize()
+            .into_bytes(),
+    )
+}
+fn verify(
+    key: &[u8],
+    role: &str,
+    client: &str,
+    server: &str,
+    payload: &str,
+    signature: &str,
+) -> Result<()> {
+    let bytes = hex::decode(signature).context("invalid broker proof")?;
+    mac(key, role, client, server, payload)
+        .verify_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("background service authentication failed"))
+}
+fn send_frame(socket: &mut TcpStream, value: &impl Serialize) -> Result<()> {
+    serde_json::to_writer(&mut *socket, value)?;
+    socket.write_all(b"\n")?;
+    socket.flush()?;
+    Ok(())
+}
+fn receive<T: serde::de::DeserializeOwned>(socket: &mut TcpStream, limit: u64) -> Result<T> {
+    let mut bytes = Zeroizing::new(Vec::new());
+    BufReader::new(socket)
+        .take(limit + 1)
+        .read_until(b'\n', &mut bytes)?;
+    if bytes.len() as u64 > limit || bytes.last() != Some(&b'\n') {
+        bail!("invalid broker frame");
+    }
+    Ok(serde_json::from_slice(&bytes)?)
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -134,8 +226,8 @@ pub fn token_path(owner: &str) -> Result<PathBuf> {
     #[cfg(target_os = "macos")]
     let base = PathBuf::from("/Library/Application Support/EasyConnect");
     #[cfg(target_os = "windows")]
-    let base = PathBuf::from(std::env::var_os("ProgramData").context("ProgramData unavailable")?)
-        .join("EasyConnect");
+    let base = known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramData)?
+        .join("EasyConnect Rust");
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let base = PathBuf::from("/unsupported");
     Ok(base.join(format!("rpc-{owner}.token")))
@@ -153,35 +245,125 @@ fn token(owner: &str) -> Result<Zeroizing<String>> {
 pub fn installed() -> bool {
     current_owner().and_then(|o| token(&o)).is_ok()
 }
+#[cfg(target_os = "macos")]
+fn socket_path(owner: &str) -> Result<PathBuf> {
+    validate_owner(owner)?;
+    Ok(PathBuf::from(format!("/var/run/easy-connect-{owner}.sock")))
+}
+#[cfg(target_os = "macos")]
+fn connect_broker(owner: &str) -> Result<TcpStream> {
+    use std::os::fd::AsRawFd;
+    let socket =
+        TcpStream::connect(socket_path(owner)?).context("background service is not running")?;
+    let mut uid = 0;
+    let mut gid = 0;
+    // SAFETY: live descriptor and valid integer output pointers.
+    if unsafe { libc::getpeereid(socket.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if uid != 0 {
+        bail!("broker endpoint is not root-owned");
+    }
+    Ok(socket)
+}
+#[cfg(target_os = "windows")]
+fn connect_broker(_: &str) -> Result<TcpStream> {
+    use std::os::windows::process::CommandExt;
+    let socket = TcpStream::connect_timeout(&([127, 0, 0, 1], PORT).into(), Duration::from_secs(2))
+        .context("background service is not running")?;
+    let status = Command::new("sc.exe")
+        .creation_flags(0x08000000)
+        .args(["queryex", NAME])
+        .output()?;
+    let text = String::from_utf8_lossy(&status.stdout);
+    let pid = text
+        .lines()
+        .find_map(|s| {
+            s.trim()
+                .strip_prefix("PID")
+                .and_then(|s| s.trim().strip_prefix(':'))
+                .and_then(|s| s.trim().parse::<u32>().ok())
+        })
+        .filter(|p| *p != 0)
+        .context("broker SCM identity unavailable")?;
+    let table = Command::new("netstat.exe")
+        .creation_flags(0x08000000)
+        .args(["-ano", "-p", "tcp"])
+        .output()?;
+    let endpoint = format!("127.0.0.1:{PORT}");
+    let text = String::from_utf8_lossy(&table.stdout);
+    if !text.lines().any(|line| {
+        let p: Vec<_> = line.split_whitespace().collect();
+        p.get(1) == Some(&endpoint.as_str())
+            && p.last().and_then(|v| v.parse::<u32>().ok()) == Some(pid)
+    }) {
+        bail!("broker endpoint does not belong to the installed SCM service");
+    }
+    Ok(socket)
+}
+#[cfg(target_os = "macos")]
+struct SocketGuard(PathBuf);
+#[cfg(target_os = "macos")]
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 pub fn request(request: Request) -> Result<Status> {
-    let capability = token(&current_owner()?)?;
-    let mut socket =
-        TcpStream::connect_timeout(&([127, 0, 0, 1], PORT).into(), Duration::from_secs(2))
-            .context("background service is not running")?;
+    let owner = current_owner()?;
+    let capability = token(&owner)?;
+    let mut socket = connect_broker(&owner)?;
     socket.set_read_timeout(Some(Duration::from_secs(5)))?;
     socket.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let envelope = Envelope {
-        token: capability.to_string(),
-        request,
-    };
-    let mut body = Zeroizing::new(serde_json::to_vec(&envelope)?);
-    body.push(b'\n');
-    if body.len() as u64 > LIMIT {
+    let client = nonce();
+    send_frame(
+        &mut socket,
+        &Challenge {
+            nonce: client.clone(),
+        },
+    )?;
+    let server: ServerProof = receive(&mut socket, LIMIT)?;
+    if !valid_nonce(&server.nonce) {
+        bail!("invalid broker nonce");
+    }
+    // Authenticate the server before serializing or transmitting a VPN password.
+    verify(
+        capability.as_bytes(),
+        "server",
+        &client,
+        &server.nonce,
+        "",
+        &server.proof,
+    )?;
+    let payload = Zeroizing::new(serde_json::to_string(&request)?);
+    if payload.len() as u64 > LIMIT / 2 {
         bail!("request too large");
     }
-    socket.write_all(&body)?;
-    let mut output = String::new();
-    BufReader::new(socket)
-        .take(262144)
-        .read_to_string(&mut output)?;
-    let response: Response = serde_json::from_str(&output)?;
+    let frame = Frame {
+        proof: proof(
+            capability.as_bytes(),
+            "request",
+            &client,
+            &server.nonce,
+            &payload,
+        ),
+        payload: payload.to_string(),
+    };
+    send_frame(&mut socket, &frame)?;
+    let frame: Frame = receive(&mut socket, 2 * 1024 * 1024)?;
+    verify(
+        capability.as_bytes(),
+        "response",
+        &client,
+        &server.nonce,
+        &frame.payload,
+        &frame.proof,
+    )?;
+    let response: Response = serde_json::from_str(&frame.payload)?;
     if let Some(error) = response.error {
         bail!("{error}");
     }
     response.status.context("missing service status")
-}
-fn authorized(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0_u8, |v, (a, b)| v | (a ^ b)) == 0
 }
 fn validate_credentials(
     gateway: &str,
@@ -364,7 +546,36 @@ fn logs(reader: impl Read + Send + 'static, state: Arc<Mutex<Status>>) {
 pub fn run(owner: &str, stop: Arc<AtomicBool>) -> Result<()> {
     crate::tun::preflight()?;
     let capability = token(owner)?;
+    #[cfg(target_os = "windows")]
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, PORT))?;
+    #[cfg(target_os = "macos")]
+    let (listener, _socket_guard) = {
+        use std::{
+            ffi::CString,
+            os::unix::{
+                ffi::OsStrExt,
+                fs::{FileTypeExt, PermissionsExt},
+            },
+        };
+        let path = socket_path(owner)?;
+        if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+            if !metadata.file_type().is_socket() {
+                bail!("broker path is not a socket");
+            }
+            if TcpStream::connect(&path).is_ok() {
+                bail!("another broker instance is active");
+            }
+            std::fs::remove_file(&path)?;
+        }
+        let listener = TcpListener::bind(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let file = CString::new(path.as_os_str().as_bytes())?;
+        // SAFETY: live NUL-terminated socket path and validated owner UID.
+        if unsafe { libc::chown(file.as_ptr(), owner.parse()?, u32::MAX) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        (listener, SocketGuard(path))
+    };
     listener.set_nonblocking(true)?;
     let mut worker = Worker {
         child: None,
@@ -374,25 +585,49 @@ pub fn run(owner: &str, stop: Arc<AtomicBool>) -> Result<()> {
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((mut socket, peer)) => {
+                #[cfg(target_os = "windows")]
                 if !peer.ip().is_loopback() {
                     continue;
                 }
+                #[cfg(target_os = "macos")]
+                let _ = peer;
                 socket.set_read_timeout(Some(Duration::from_secs(2)))?;
                 socket.set_write_timeout(Some(Duration::from_secs(2)))?;
-                let result = (|| -> Result<Status> {
-                    let mut bytes = Zeroizing::new(Vec::new());
-                    BufReader::new(&mut socket)
-                        .take(LIMIT + 1)
-                        .read_until(b'\n', &mut bytes)?;
-                    if bytes.len() as u64 > LIMIT || bytes.last() != Some(&b'\n') {
-                        bail!("invalid request");
+                let exchange = (|| -> Result<(String, String, Request)> {
+                    let client: Challenge = receive(&mut socket, LIMIT)?;
+                    if !valid_nonce(&client.nonce) {
+                        bail!("invalid client nonce");
                     }
-                    let envelope: Envelope = serde_json::from_slice(&bytes)?;
-                    if !authorized(envelope.token.as_bytes(), capability.as_bytes()) {
-                        bail!("unauthorized");
-                    }
-                    worker.handle(&envelope.request)
+                    let server = nonce();
+                    send_frame(
+                        &mut socket,
+                        &ServerProof {
+                            proof: proof(
+                                capability.as_bytes(),
+                                "server",
+                                &client.nonce,
+                                &server,
+                                "",
+                            ),
+                            nonce: server.clone(),
+                        },
+                    )?;
+                    let frame: Frame = receive(&mut socket, LIMIT)?;
+                    verify(
+                        capability.as_bytes(),
+                        "request",
+                        &client.nonce,
+                        &server,
+                        &frame.payload,
+                        &frame.proof,
+                    )?;
+                    let request: Request = serde_json::from_str(&frame.payload)?;
+                    Ok((client.nonce, server, request))
                 })();
+                let Ok((client, server, request)) = exchange else {
+                    continue;
+                };
+                let result = worker.handle(&request);
                 let response = match result {
                     Ok(status) => Response {
                         status: Some(status),
@@ -403,7 +638,18 @@ pub fn run(owner: &str, stop: Arc<AtomicBool>) -> Result<()> {
                         error: Some(error.to_string()),
                     },
                 };
-                let _ = serde_json::to_writer(&mut socket, &response);
+                let payload = serde_json::to_string(&response)?;
+                let frame = Frame {
+                    proof: proof(
+                        capability.as_bytes(),
+                        "response",
+                        &client,
+                        &server,
+                        &payload,
+                    ),
+                    payload,
+                };
+                let _ = send_frame(&mut socket, &frame);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(25))
@@ -425,7 +671,15 @@ pub fn install(owner: &str) -> Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::{
+            ffi::CString,
+            os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+        };
+        let path = CString::new(dir.as_os_str().as_bytes())?;
+        // SAFETY: the checked directory path is NUL-terminated; root owns the shared directory.
+        if unsafe { libc::chown(path.as_ptr(), 0, 0) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
     }
     if !file.exists() {
@@ -493,8 +747,8 @@ fn install_macos(owner: &str, token: &std::path::Path) -> Result<()> {
 #[cfg(target_os = "windows")]
 fn install_windows(owner: &str, token: &std::path::Path) -> Result<()> {
     let source = std::env::current_exe()?;
-    let dir = PathBuf::from(std::env::var_os("ProgramFiles").context("ProgramFiles missing")?)
-        .join("EasyConnect");
+    let dir = known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles)?
+        .join("EasyConnect Rust");
     std::fs::create_dir_all(&dir)?;
     let _ = Command::new("sc.exe").args(["stop", NAME]).status();
     std::thread::sleep(Duration::from_secs(2));
@@ -599,9 +853,17 @@ mod tests {
         assert!(validate_credentials("https://example.com", "u", "p", None).is_ok());
     }
     #[test]
-    fn capabilities_match_exactly() {
-        assert!(authorized(b"abc", b"abc"));
-        assert!(!authorized(b"abc", b"abd"));
-        assert!(!authorized(b"abc", b"ab"));
+    fn broker_proofs_bind_role_nonces_and_payload() {
+        let signature = proof(b"key", "request", "client", "server", "data");
+        assert!(verify(b"key", "request", "client", "server", "data", &signature).is_ok());
+        assert!(verify(b"other", "request", "client", "server", "data", &signature).is_err());
+        assert!(verify(b"key", "response", "client", "server", "data", &signature).is_err());
+        assert!(verify(b"key", "request", "different", "server", "data", &signature).is_err());
+        assert!(
+            verify(
+                b"key", "request", "client", "server", "tampered", &signature
+            )
+            .is_err()
+        );
     }
 }
