@@ -2,6 +2,7 @@ use super::*;
 
 struct PasswordView {
     parent: gpui::WeakEntity<Desktop>,
+    live: Arc<Mutex<Live>>,
     old: Entity<InputState>,
     new: Entity<InputState>,
     confirm: Entity<InputState>,
@@ -9,14 +10,7 @@ struct PasswordView {
 }
 impl Render for PasswordView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let notice = self.parent.upgrade().and_then(|p| {
-            p.read(cx)
-                .controller
-                .live
-                .lock()
-                .ok()
-                .and_then(|s| s.notice.clone())
-        });
+        let notice = self.live.lock().ok().and_then(|s| s.notice.clone());
         div()
             .size_full()
             .bg(rgb(0x10161e))
@@ -97,6 +91,7 @@ impl Desktop {
             return;
         }
         let parent = cx.weak_entity();
+        let live = self.controller.live.clone();
         let old = Zeroizing::new(self.password.read(cx).value().to_string());
         let bounds = Bounds::centered(None, size(px(400.), px(350.)), cx);
         match cx.open_window(
@@ -118,6 +113,7 @@ impl Desktop {
                 let confirm = cx.new(|cx| InputState::new(window, cx).masked(true));
                 let view = cx.new(|_| PasswordView {
                     parent,
+                    live,
                     old,
                     new,
                     confirm,
