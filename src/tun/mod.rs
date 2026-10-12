@@ -4,6 +4,12 @@ mod dns;
 pub mod routes;
 #[cfg(target_os = "windows")]
 mod windows_dns;
+#[cfg(target_os = "windows")]
+pub(crate) fn cleanup_worker_dns(pid: u32) {
+    if let Err(error) = windows_dns::cleanup_pid(pid) {
+        eprintln!("stale worker DNS cleanup: {error}");
+    }
+}
 
 use crate::resources::PublishedResources;
 use anyhow::{Result, bail};

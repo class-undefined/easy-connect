@@ -61,6 +61,17 @@ impl GatewayArgs {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Install the per-user privileged background broker (run elevated once).
+    InstallService {
+        #[arg(long)]
+        owner: String,
+    },
+    /// Internal launchd/SCM entry point.
+    #[command(hide = true)]
+    Service {
+        #[arg(long)]
+        owner: String,
+    },
     /// Check macOS utun and ICMP forwarding locally, without a VPN login.
     TunSelfTest,
     /// Generate a profile. No connection or credential storage.
@@ -103,6 +114,8 @@ enum Command {
         /// Read exactly two lines (username/password) from stdin until EOF.
         #[arg(long, conflicts_with = "username")]
         credentials_stdin: bool,
+        #[arg(long, requires = "credentials_stdin", hide = true)]
+        shutdown_stdin: bool,
         #[arg(long, value_enum, default_value = "tun")]
         mode: ConnectMode,
         #[arg(long, default_value = "127.0.0.1:1080")]
@@ -141,7 +154,7 @@ fn profile(gateway: &str, pin: Option<&str>) -> Result<Value> {
     }))
 }
 
-fn validate_gateway(gateway: &str) -> Result<()> {
+pub(crate) fn validate_gateway(gateway: &str) -> Result<()> {
     let url = Url::parse(gateway).context("invalid gateway URL")?;
     if url.scheme() != "https"
         || url.host_str().is_none()
@@ -228,7 +241,31 @@ fn configured_dns(config: &Value) -> Result<Vec<Ipv4Addr>> {
 fn credentials(
     username: Option<String>,
     stdin: bool,
+    controlled: bool,
 ) -> Result<(Zeroizing<String>, Zeroizing<String>)> {
+    if controlled {
+        use std::io::{BufRead, Read};
+        let mut input = std::io::stdin().lock();
+        let mut lines = Vec::new();
+        for _ in 0..2 {
+            let mut bytes = Zeroizing::new(Vec::new());
+            input.by_ref().take(8193).read_until(b'\n', &mut bytes)?;
+            if bytes.len() > 8192 || bytes.last() != Some(&b'\n') {
+                bail!("invalid controlled credential input");
+            }
+            bytes.pop();
+            lines.push(Zeroizing::new(String::from_utf8(bytes.to_vec())?));
+        }
+        let password = lines.pop().context("missing password")?;
+        let username = lines.pop().context("missing username")?;
+        drop(input);
+        std::thread::spawn(|| {
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            crate::service::STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        return Ok((username, password));
+    }
     if stdin {
         return Ok(read_credentials(io::stdin().lock())?);
     }
@@ -424,19 +461,41 @@ async fn connect(
 }
 
 pub(crate) async fn shutdown_signal() -> Result<()> {
+    let stopped = async {
+        while !crate::service::STOP.load(std::sync::atomic::Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
     #[cfg(unix)]
     {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! { result = tokio::signal::ctrl_c() => result?, _ = term.recv() => {} }
+        tokio::select! { result = tokio::signal::ctrl_c() => result?, _ = term.recv() => {}, _=stopped=>{} }
     }
     #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await?;
+    tokio::select! {result=tokio::signal::ctrl_c()=>result?,_=stopped=>{}}
     Ok(())
 }
 
 #[tokio::main]
 pub async fn run() -> Result<()> {
     match Cli::parse().command {
+        Command::InstallService { owner } => crate::service::install(&owner),
+        Command::Service { owner } => {
+            #[cfg(target_os = "windows")]
+            {
+                crate::service::run_windows(owner)
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let flag = stop.clone();
+                tokio::spawn(async move {
+                    let _ = shutdown_signal().await;
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                });
+                tokio::task::spawn_blocking(move || crate::service::run(&owner, stop)).await?
+            }
+        }
         Command::TunSelfTest => {
             tun::preflight()?;
             tun::self_test().await
@@ -481,7 +540,7 @@ pub async fn run() -> Result<()> {
         } => {
             let config = target.resolve(false)?;
             tokio::task::spawn_blocking(move || {
-                let (username, password) = credentials(username, credentials_stdin)?;
+                let (username, password) = credentials(username, credentials_stdin, false)?;
                 list_resources(config, username, password)
             })
             .await?
@@ -490,22 +549,83 @@ pub async fn run() -> Result<()> {
             target,
             username,
             credentials_stdin,
+            shutdown_stdin,
             listen,
             mode,
         } => {
             let config = target.resolve(true)?;
-            if mode == ConnectMode::Tun {
+            let brokered = mode == ConnectMode::Tun
+                && tun::preflight().is_err()
+                && crate::service::installed();
+            if mode == ConnectMode::Tun && !brokered {
                 tun::preflight()?;
             }
             if mode == ConnectMode::Socks && (!listen.ip().is_loopback() || listen.port() == 0) {
                 bail!("SOCKS must listen on loopback with nonzero port");
             }
-            let (username, password) =
-                tokio::task::spawn_blocking(move || credentials(username, credentials_stdin))
-                    .await??;
+            let (username, password) = tokio::task::spawn_blocking(move || {
+                credentials(username, credentials_stdin, shutdown_stdin)
+            })
+            .await??;
+            if brokered {
+                return connect_brokered(config, username, password).await;
+            }
             connect(config, username, password, listen, mode).await
         }
     }
+}
+
+async fn connect_brokered(
+    config: Value,
+    username: Zeroizing<String>,
+    password: Zeroizing<String>,
+) -> Result<()> {
+    if !config["proxy"]["auto_resources"].as_bool().unwrap_or(true)
+        || config["proxy"]["route_domains"]
+            .as_array()
+            .is_some_and(|v| !v.is_empty())
+        || config["proxy"]["route_ipv4_cidrs"]
+            .as_array()
+            .is_some_and(|v| !v.is_empty())
+    {
+        bail!(
+            "brokered CLI connections use gateway defaults; custom routing still requires direct elevation"
+        );
+    }
+    let request = crate::service::Request::Connect {
+        gateway: config["base_url"]
+            .as_str()
+            .context("missing gateway")?
+            .to_owned(),
+        username: username.to_string(),
+        password: password.to_string(),
+        cert_sha256: config["tls"]["leaf_sha256"].as_str().map(str::to_owned),
+    };
+    tokio::task::spawn_blocking(move || crate::service::request(request)).await??;
+    let watch = async {
+        let mut seen = 0;
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let status = tokio::task::spawn_blocking(|| {
+                crate::service::request(crate::service::Request::Status)
+            })
+            .await??;
+            for line in status.logs.iter().skip(seen) {
+                println!("{line}");
+            }
+            seen = status.logs.len();
+            if matches!(
+                status.phase,
+                crate::service::Phase::Disconnected | crate::service::Phase::Failed
+            ) {
+                bail!("background connection ended");
+            }
+        }
+    };
+    let result = tokio::select! {result=watch=>result,result=shutdown_signal()=>result};
+    tokio::task::spawn_blocking(|| crate::service::request(crate::service::Request::Disconnect))
+        .await??;
+    result
 }
 
 #[cfg(test)]
