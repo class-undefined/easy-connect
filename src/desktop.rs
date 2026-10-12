@@ -40,6 +40,7 @@ gpui::actions!(
         DisconnectVpn,
         ShowLogs,
         ShowAbout,
+        ShowPassword,
         CheckUpdates,
         QuitApp
     ]
@@ -52,6 +53,7 @@ enum MenuCommand {
     Disconnect,
     Logs,
     About,
+    Password,
     Updates,
     Quit,
 }
@@ -631,6 +633,7 @@ fn install_menus(queue: Arc<Mutex<Vec<MenuCommand>>>, cx: &mut gpui::App) {
     }
     register!(ShowMain, MenuCommand::Show);
     register!(ShowAbout, MenuCommand::About);
+    register!(ShowPassword, MenuCommand::Password);
     register!(ConnectVpn, MenuCommand::Connect);
     register!(DisconnectVpn, MenuCommand::Disconnect);
     register!(ShowLogs, MenuCommand::Logs);
@@ -654,6 +657,8 @@ fn install_menus(queue: Arc<Mutex<Vec<MenuCommand>>>, cx: &mut gpui::App) {
             items: vec![
                 gpui::MenuItem::action("连接", ConnectVpn),
                 gpui::MenuItem::action("断开", DisconnectVpn),
+                gpui::MenuItem::separator(),
+                gpui::MenuItem::action("修改 VPN 密码…", ShowPassword),
             ],
         },
         gpui::Menu {
@@ -718,6 +723,7 @@ impl Desktop {
             }
             MenuCommand::Logs => self.open_logs(cx),
             MenuCommand::About => self.open_about(cx),
+            MenuCommand::Password => self.open_password(cx),
             MenuCommand::Quit => {
                 self.startup_pending = false;
                 let live = self.controller.live.clone();
