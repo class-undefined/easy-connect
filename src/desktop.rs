@@ -289,6 +289,7 @@ struct Desktop {
     about_window: Option<AnyWindowHandle>,
     password_window: Option<AnyWindowHandle>,
     logs_item: MenuItem,
+    about_item: MenuItem,
     updates_item: MenuItem,
     controller: Controller,
     tray: TrayIcon,
@@ -366,8 +367,16 @@ impl Desktop {
         let disconnect = MenuItem::new("断开隧道", true, None);
         let quit = MenuItem::new("退出", true, None);
         let logs_item = MenuItem::new("事件日志", true, None);
+        let about_item = MenuItem::new("关于 EasyConnect", true, None);
         let updates_item = MenuItem::new("检查更新", true, None);
-        menu.append_items(&[&show, &disconnect, &logs_item, &updates_item, &quit])?;
+        menu.append_items(&[
+            &show,
+            &disconnect,
+            &logs_item,
+            &updates_item,
+            &about_item,
+            &quit,
+        ])?;
         let tray = TrayIconBuilder::new()
             .with_icon(tray_icon(false)?)
             .with_icon_as_template(cfg!(target_os = "macos"))
@@ -401,6 +410,7 @@ impl Desktop {
             about_window: None,
             password_window: None,
             logs_item,
+            about_item,
             updates_item,
             controller: Controller::new(),
             tray,
@@ -519,6 +529,8 @@ impl Desktop {
                 Some(MenuCommand::Disconnect)
             } else if event.id == *self.logs_item.id() {
                 Some(MenuCommand::Logs)
+            } else if event.id == *self.about_item.id() {
+                Some(MenuCommand::About)
             } else if event.id == *self.updates_item.id() {
                 Some(MenuCommand::Updates)
             } else if event.id == *self.quit.id() {
@@ -960,36 +972,30 @@ impl Render for Desktop {
                                     ),
                             )
                             .child(
-                                div()
-                                    .flex()
-                                    .gap(px(8.))
-                                    .child(
-                                        button(
-                                            "connect",
-                                            if busy {
-                                                "处理中…"
-                                            } else if connected {
-                                                "断开连接"
-                                            } else {
-                                                "连接"
-                                            },
-                                            true,
-                                        )
-                                        .flex_1()
-                                        .on_click(
-                                            cx.listener(move |view, _, window, cx| {
-                                                if connected {
-                                                    view.startup_pending = false;
-                                                    view.controller.disconnect();
-                                                } else {
-                                                    view.connect(window, cx);
-                                                }
-                                            }),
-                                        ),
+                                div().flex().gap(px(8.)).child(
+                                    button(
+                                        "connect",
+                                        if busy {
+                                            "处理中…"
+                                        } else if connected {
+                                            "断开连接"
+                                        } else {
+                                            "连接"
+                                        },
+                                        true,
                                     )
-                                    .child(button("logs", "日志", false).on_click(
-                                        cx.listener(|view, _, _, cx| view.open_logs(cx)),
+                                    .flex_1()
+                                    .on_click(cx.listener(
+                                        move |view, _, window, cx| {
+                                            if connected {
+                                                view.startup_pending = false;
+                                                view.controller.disconnect();
+                                            } else {
+                                                view.connect(window, cx);
+                                            }
+                                        },
                                     )),
+                                ),
                             )
                             .when_some(policy, |s, policy| {
                                 s.child(
@@ -1112,7 +1118,6 @@ impl Render for Desktop {
                     .px(px(12.))
                     .flex()
                     .items_center()
-                    .justify_between()
                     .bg(rgb(0x18212c))
                     .border_t_1()
                     .border_color(rgb(0x303e4e))
@@ -1126,10 +1131,6 @@ impl Render for Desktop {
                             .when_some(status.and_then(|s| s.address), |s, address| {
                                 s.child(address)
                             }),
-                    )
-                    .child(
-                        button("about", "关于", false)
-                            .on_click(cx.listener(|view, _, _, cx| view.open_about(cx))),
                     ),
             )
     }
