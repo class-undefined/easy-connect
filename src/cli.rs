@@ -105,6 +105,13 @@ enum Command {
         #[arg(long, conflicts_with = "username")]
         credentials_stdin: bool,
     },
+    /// Change the VPN account password interactively, without starting a tunnel.
+    ChangePassword {
+        #[command(flatten)]
+        target: GatewayArgs,
+        #[arg(long)]
+        username: Option<String>,
+    },
     /// Connect using TUN (default) or loopback SOCKS5.
     Connect {
         #[command(flatten)]
@@ -123,7 +130,7 @@ enum Command {
     },
 }
 
-fn profile(gateway: &str, pin: Option<&str>) -> Result<Value> {
+pub(crate) fn profile(gateway: &str, pin: Option<&str>) -> Result<Value> {
     validate_gateway(gateway)?;
     let url = Url::parse(gateway)?;
     let pin = pin.or_else(|| {
@@ -387,6 +394,9 @@ async fn connect(
     // reqwest's blocking client must be created, used, and dropped outside Tokio workers.
     let (session, published, policy) = tokio::task::spawn_blocking(move || -> Result<_> {
         let session = AuthenticatedEngineSession::authenticate(&config, &username, &password)?;
+        if let Some(policy) = session.password_policy() {
+            eprintln!("{} {}", policy.message(), policy.marker());
+        }
         let result = (|| -> Result<_> {
             let xml = session.resource_xml()?;
             let published = PublishedResources::parse(&xml)?;
@@ -537,6 +547,21 @@ pub async fn run() -> Result<()> {
             load_profile(&config, true)?;
             println!("Profile valid");
             Ok(())
+        }
+        Command::ChangePassword { target, username } => {
+            let config = target.resolve(false)?;
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let (username, old) = credentials(username, false, false)?;
+                let new = Zeroizing::new(rpassword::prompt_password("New VPN password: ")?);
+                let confirm = Zeroizing::new(rpassword::prompt_password("Confirm new password: ")?);
+                if new.as_str() != confirm.as_str() {
+                    bail!("两次输入的新密码不一致");
+                }
+                ec_compat::password::change_password(&config, &username, &old, &new)?;
+                println!("密码已更新，请使用新密码重新连接。");
+                Ok(())
+            })
+            .await?
         }
         Command::Resources {
             target,

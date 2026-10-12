@@ -4,6 +4,7 @@ pub mod binary_watch;
 pub mod config;
 pub mod engine;
 pub mod modern;
+pub mod password;
 pub mod probe;
 pub mod protocol_map;
 pub mod special_tls11;

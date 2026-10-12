@@ -160,6 +160,8 @@ pub struct Status {
     pub groups: usize,
     pub logs: VecDeque<String>,
     pub version: String,
+    #[serde(default)]
+    pub password_policy: Option<ec_compat::password::PasswordPolicy>,
 }
 impl Default for Status {
     fn default() -> Self {
@@ -172,6 +174,7 @@ impl Default for Status {
             groups: 0,
             logs: VecDeque::new(),
             version: env!("CARGO_PKG_VERSION").into(),
+            password_policy: None,
         }
     }
 }
@@ -525,6 +528,9 @@ fn logs(reader: impl Read + Send + 'static, state: Arc<Mutex<Status>>) {
             let Ok(mut state) = state.lock() else {
                 break;
             };
+            if let Some(policy) = ec_compat::password::PasswordPolicy::from_log(&line) {
+                state.password_policy = Some(policy);
+            }
             let words: Vec<_> = line.split_whitespace().collect();
             if line.starts_with("TUN ready:") {
                 state.phase = Phase::Connected;

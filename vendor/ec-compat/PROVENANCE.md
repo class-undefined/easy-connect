@@ -68,3 +68,7 @@ packaged application's `legal/electron/` directory as described in
   provenance audit.
 - Record new copied, translated, vendored, linked, or source-reviewed projects
   here before merging the affected code.
+
+## easy-connect password policy compatibility (2026-10-12)
+
+The added `src/password.rs` and the authentication-session refactor were informed by protocol review of the installed Sangfor EasyConnect 7.6.7.10 Web SDK (`common/dto.js`, `api/person_setting.js`, `business/user_settings.js`, `local/connect/connect.js`) and gateway-served password-change pages. No official JavaScript is redistributed. Endpoint names, response fields and policy bit semantics are documented in the root project's `docs/password-policy.md`; synthetic protocol tests do not change a real account password.
