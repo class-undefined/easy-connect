@@ -139,22 +139,10 @@ pub async fn run(
     mtu: usize,
 ) -> Result<()> {
     use anyhow::Context;
-    use std::{
-        collections::BTreeSet,
-        net::{Shutdown, TcpStream},
-        sync::Mutex,
-    };
+    use std::{collections::BTreeSet, sync::Mutex};
     use zeroize::Zeroizing;
 
-    struct Sockets([TcpStream; 3]);
-    impl Drop for Sockets {
-        fn drop(&mut self) {
-            for socket in &self.0 {
-                let _ = socket.shutdown(Shutdown::Both);
-            }
-        }
-    }
-    let sockets = Sockets(plane.shutdown_handles()?);
+    let sockets = plane.shutdown_handle();
     let address = plane.assigned_address();
     let peer = match plane.peer_address()?.ip() {
         std::net::IpAddr::V4(ip) => ip,

@@ -71,6 +71,7 @@ impl Drop for ModernSessionId {
     }
 }
 
+#[derive(Clone)]
 pub struct ModernToken([u8; MODERN_TOKEN_LEN]);
 
 impl ModernToken {
@@ -93,7 +94,7 @@ impl ModernToken {
         Ok(Self(token))
     }
 
-    fn as_bytes(&self) -> &[u8; MODERN_TOKEN_LEN] {
+    pub(crate) fn as_bytes(&self) -> &[u8; MODERN_TOKEN_LEN] {
         &self.0
     }
 }
@@ -146,6 +147,8 @@ impl Drop for ModernTokenAcquisition {
 #[repr(u32)]
 pub enum ModernCommand {
     RequestAddress = 0,
+    Reconnect = 1,
+    Heartbeat = 3,
     Send = 5,
     Receive = 6,
 }
@@ -162,7 +165,7 @@ impl ModernControlRequest {
         request[..4].copy_from_slice(&(command as u32).to_le_bytes());
         request[4..52].copy_from_slice(token.as_bytes());
         match command {
-            ModernCommand::RequestAddress => {
+            ModernCommand::RequestAddress | ModernCommand::Reconnect => {
                 if address.is_some() {
                     return Err(Error(
                         "address request must not contain a prior virtual address".into(),
@@ -177,6 +180,11 @@ impl ModernControlRequest {
                 let mut octets = address.octets();
                 octets.reverse();
                 request[60..64].copy_from_slice(&octets);
+            }
+            ModernCommand::Heartbeat => {
+                if address.is_some() {
+                    return Err(Error("heartbeat must not contain a virtual address".into()));
+                }
             }
         }
         Ok(Self(request))
@@ -209,7 +217,7 @@ pub fn validate_channel_reply(reply: &[u8], command: ModernCommand) -> Result<()
     let expected = match command {
         ModernCommand::Send => 2,
         ModernCommand::Receive => 1,
-        ModernCommand::RequestAddress => {
+        ModernCommand::RequestAddress | ModernCommand::Reconnect | ModernCommand::Heartbeat => {
             return Err(Error(
                 "address replies require the address reply parser".into(),
             ));

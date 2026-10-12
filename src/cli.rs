@@ -483,9 +483,10 @@ async fn connect(
         }
     })
     .await??;
-    let Some((session, plane)) = established else {
+    let Some((session, mut plane)) = established else {
         return Ok(());
     };
+    let health_events = plane.take_health_events();
     let service = async {
         if mode == ConnectMode::Tun {
             tun::run(plane, published, policy, service_config, dns, mtu).await
@@ -522,7 +523,7 @@ async fn connect(
             .map_err(anyhow::Error::from)
         },
         finished,
-        Duration::from_secs(10),
+        health_events,
     );
     tokio::pin!(service, monitor);
     let (service_result, session, reason) = tokio::select! {
@@ -530,6 +531,9 @@ async fn connect(
         biased;
         result = &mut service => {
             let cancelled = result.is_ok() || connection_cancelled();
+            if !cancelled && let Err(error) = &result {
+                eprintln!("VPN data service stopped: {error:#}");
+            }
             let _ = finish.send(!cancelled);
             let (session, reason) = monitor.await?;
             let cancelled = cancelled || connection_cancelled();
@@ -574,18 +578,21 @@ fn connection_cancelled() -> bool {
 
 /// The state stays on a blocking worker during each HTTPS request. We always
 /// await that worker (including on cancellation) so reqwest is never dropped
-/// on an async runtime thread and no authenticated session is abandoned.
+/// on an async runtime thread and no authenticated session is abandoned. Healthy
+/// transports never query the portal: only transport faults or the final service
+/// failure trigger a query to distinguish connectivity loss from remote logout.
 async fn monitor_session<S, F, Fut>(
     mut session: S,
     mut query: F,
     mut finished: tokio::sync::oneshot::Receiver<bool>,
-    interval: Duration,
+    mut health_events: tokio::sync::mpsc::Receiver<()>,
 ) -> Result<(S, Option<SessionEndReason>)>
 where
     F: FnMut(S) -> Fut,
     Fut: std::future::Future<Output = Result<(S, ec_compat::Result<SessionStatus>)>>,
 {
-    let mut failures = 0;
+    let mut failures = 0_u32;
+    let mut health_events_open = true;
     loop {
         let mut final_query = tokio::select! {
             biased;
@@ -593,7 +600,15 @@ where
                 if command != Ok(true) { return Ok((session, None)); }
                 true
             },
-            _ = tokio::time::sleep(interval) => false,
+            event = health_events.recv(), if health_events_open => {
+                if event.is_none() {
+                    // Closing the transport notification stream does not itself
+                    // prove a failure; the data service owns the final outcome.
+                    health_events_open = false;
+                    continue;
+                }
+                false
+            },
         };
         let (returned, status) = query(session).await?;
         session = returned;
@@ -608,11 +623,21 @@ where
         }
         match status {
             Ok(SessionStatus::Ended(reason)) => return Ok((session, Some(reason))),
-            Ok(SessionStatus::Online) if !final_query => failures = 0,
+            Ok(SessionStatus::Online) if !final_query => {
+                if failures > 0 {
+                    eprintln!("VPN session status query recovered");
+                }
+                failures = 0;
+            }
             Err(_) if !final_query => {
-                failures += 1;
-                if failures >= 3 {
-                    return Ok((session, Some(SessionEndReason::ConnectionLost)));
+                // The portal and packet transport are independent connections.
+                // An unavailable/unsupported status endpoint does not prove
+                // that the data channel failed. Its owner monitors actual I/O.
+                failures = failures.saturating_add(1_u32);
+                if failures == 1 || failures.is_multiple_of(6) {
+                    eprintln!(
+                        "VPN session status query failed ({failures} consecutive transport events); allowing data channel recovery"
+                    );
                 }
             }
             // A broken data channel with an online/unknown control session is
@@ -812,6 +837,14 @@ async fn connect_brokered(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn queued_health_events(count: usize) -> tokio::sync::mpsc::Receiver<()> {
+        let (events, receiver) = tokio::sync::mpsc::channel(count.max(1));
+        for _ in 0..count {
+            events.try_send(()).unwrap();
+        }
+        receiver
+    }
+
     #[tokio::test]
     async fn session_monitor_cancellation_never_queries_or_reports_a_failure() {
         let (finish, finished) = tokio::sync::oneshot::channel();
@@ -819,16 +852,64 @@ mod tests {
         let (_, reason) = monitor_session(
             (),
             |_| async {
-                panic!("manual cancellation must not query the gateway");
+                panic!("manual cancellation must win over a queued transport fault");
                 #[allow(unreachable_code)]
                 Ok(((), Ok(SessionStatus::Online)))
             },
             finished,
-            Duration::ZERO,
+            queued_health_events(1),
         )
         .await
         .unwrap();
         assert_eq!(reason, None);
+    }
+
+    #[tokio::test]
+    async fn healthy_session_never_queries_the_gateway() {
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let (_events, health_events) = tokio::sync::mpsc::channel(1);
+        let monitor = monitor_session(
+            (),
+            |_| async {
+                panic!("healthy transports must not query the gateway");
+                #[allow(unreachable_code)]
+                Ok(((), Ok(SessionStatus::Online)))
+            },
+            finished,
+            health_events,
+        );
+        tokio::pin!(monitor);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut monitor)
+                .await
+                .is_err()
+        );
+        finish.send(false).unwrap();
+        assert_eq!(monitor.await.unwrap().1, None);
+    }
+
+    #[tokio::test]
+    async fn closed_health_stream_waits_for_service_and_does_not_query() {
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let monitor = monitor_session(
+            (),
+            |_| async {
+                panic!("closed health stream alone is not a failed service");
+                #[allow(unreachable_code)]
+                Ok(((), Ok(SessionStatus::Online)))
+            },
+            finished,
+            queued_health_events(0),
+        );
+        tokio::pin!(monitor);
+        // This also catches a recv(None) loop: such a loop starves the timer.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut monitor)
+                .await
+                .is_err()
+        );
+        finish.send(false).unwrap();
+        assert_eq!(monitor.await.unwrap().1, None);
     }
 
     #[tokio::test]
@@ -842,7 +923,7 @@ mod tests {
                 async { Ok(((), Ok(SessionStatus::Ended(SessionEndReason::PrivateKick)))) }
             },
             finished,
-            Duration::ZERO,
+            queued_health_events(1),
         )
         .await
         .unwrap();
@@ -850,25 +931,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_failure_during_query_reuses_its_result() {
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let mut finish = Some(finish);
+        let (calls, reason) = monitor_session(
+            0,
+            |calls| {
+                finish
+                    .take()
+                    .expect("one query is sufficient")
+                    .send(true)
+                    .unwrap();
+                async move { Ok((calls + 1, Ok(SessionStatus::Online))) }
+            },
+            finished,
+            queued_health_events(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(reason, Some(SessionEndReason::ConnectionLost));
+    }
+
+    #[tokio::test]
     async fn broken_channel_checks_reason_and_never_assumes_private_kick() {
         for (status, expected) in [
-            (SessionStatus::Online, SessionEndReason::ConnectionLost),
+            (Ok(SessionStatus::Online), SessionEndReason::ConnectionLost),
             (
-                SessionStatus::Ended(SessionEndReason::PrivateKick),
+                Ok(SessionStatus::Ended(SessionEndReason::PrivateKick)),
                 SessionEndReason::PrivateKick,
             ),
             (
-                SessionStatus::Ended(SessionEndReason::Unknown),
+                Ok(SessionStatus::Ended(SessionEndReason::Unknown)),
                 SessionEndReason::Unknown,
+            ),
+            (
+                Err(ec_compat::Error("network".into())),
+                SessionEndReason::ConnectionLost,
             ),
         ] {
             let (finish, finished) = tokio::sync::oneshot::channel();
             finish.send(true).unwrap();
+            let mut status = Some(status);
             let (calls, reason) = monitor_session(
                 0,
-                |calls| async move { Ok((calls + 1, Ok(status))) },
+                |calls| {
+                    let status = status.take().expect("only one final query");
+                    async move { Ok((calls + 1, status)) }
+                },
                 finished,
-                Duration::from_secs(3600),
+                queued_health_events(1),
             )
             .await
             .unwrap();
@@ -878,7 +990,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn monitor_tolerates_transient_failures_and_resets_after_success() {
+    async fn monitor_tolerates_transient_events_until_remote_logout_is_confirmed() {
         let (_finish, finished) = tokio::sync::oneshot::channel();
         let responses = [
             Err(ec_compat::Error("network".into())),
@@ -895,7 +1007,7 @@ mod tests {
                 async move { Ok((calls + 1, response)) }
             },
             finished,
-            Duration::ZERO,
+            queued_health_events(5),
         )
         .await
         .unwrap();
@@ -904,18 +1016,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_status_errors_report_connection_loss() {
+    async fn repeated_status_errors_do_not_interrupt_transport_recovery() {
         let (_finish, finished) = tokio::sync::oneshot::channel();
         let (calls, reason) = monitor_session(
             0,
-            |calls| async move { Ok((calls + 1, Err(ec_compat::Error("network".into())))) },
+            |calls| async move {
+                let status = if calls < 8 {
+                    Err(ec_compat::Error("network".into()))
+                } else {
+                    Ok(SessionStatus::Ended(SessionEndReason::AdminKick))
+                };
+                Ok((calls + 1, status))
+            },
             finished,
-            Duration::ZERO,
+            queued_health_events(9),
         )
         .await
         .unwrap();
-        assert_eq!(calls, 3);
-        assert_eq!(reason, Some(SessionEndReason::ConnectionLost));
+        assert_eq!(calls, 9);
+        assert_eq!(reason, Some(SessionEndReason::AdminKick));
+    }
+
+    #[tokio::test]
+    async fn status_error_waits_for_a_new_transport_event() {
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let (events, health_events) = tokio::sync::mpsc::channel(1);
+        events.try_send(()).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let monitor = monitor_session(
+            (),
+            move |_| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                async { Ok(((), Err(ec_compat::Error("network".into())))) }
+            },
+            finished,
+            health_events,
+        );
+        tokio::pin!(monitor);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut monitor)
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        finish.send(false).unwrap();
+        assert_eq!(monitor.await.unwrap().1, None);
     }
 
     #[test]

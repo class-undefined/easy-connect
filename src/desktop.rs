@@ -1144,9 +1144,11 @@ impl Render for Desktop {
                             .gap(px(8.))
                             .child(div().size(px(7.)).bg(rgb(color)))
                             .child(div().text_color(rgb(color)).child(state))
-                            .when_some(status.and_then(|s| s.address), |s, address| {
-                                s.child(address)
-                            }),
+                            .child(
+                                div()
+                                    .text_color(rgb(0x9babb9))
+                                    .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
+                            ),
                     )
                     .child(
                         div()

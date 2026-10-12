@@ -68,6 +68,8 @@ jobs:
           cargo test --locked --features desktop --lib --target ${{ matrix.target }}
           cargo test --locked -p ec-compat --lib password::tests --target ${{ matrix.target }}
           cargo test --locked -p ec-compat --lib session_status::tests --target ${{ matrix.target }}
+          cargo test --locked -p ec-compat --lib engine::data_plane::tests --target ${{ matrix.target }}
+          cargo test --locked -p ec-compat --lib special_tls11::tests --target ${{ matrix.target }}
       - name: Clippy
         run: cargo clippy --locked --features desktop --bins --target ${{ matrix.target }} -- -D warnings
       - name: Build release executables

@@ -1,4 +1,4 @@
-use crate::engine::data_plane::EasyConnectDataPlane;
+use crate::engine::data_plane::{EasyConnectDataPlane, PlaneShutdown};
 use crate::{Error, Result};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -20,6 +20,7 @@ pub struct VirtualNetstack {
     healthy: Arc<AtomicBool>,
     _runner: tokio::task::JoinHandle<()>,
     _bridges: [JoinHandle<()>; 2],
+    shutdown: PlaneShutdown,
 }
 
 impl VirtualNetstack {
@@ -55,6 +56,7 @@ impl VirtualNetstack {
             .set_ips_blocking([IpAddr::V4(assigned_address)])
             .map_err(|_| Error("cannot assign the VPN address to the userspace stack".into()))?;
 
+        let shutdown = data_plane.shutdown_handle();
         let (lease, mut sender, mut receiver) = data_plane.split();
         let WakingPipe { mut rx, tx } = pipe;
         let healthy = Arc::new(AtomicBool::new(true));
@@ -83,6 +85,7 @@ impl VirtualNetstack {
             healthy,
             _runner: runner,
             _bridges: [receive_bridge, send_bridge],
+            shutdown,
         })
     }
 
@@ -143,6 +146,13 @@ impl VirtualNetstack {
                 return current;
             }
         }
+    }
+}
+
+impl Drop for VirtualNetstack {
+    fn drop(&mut self) {
+        self.shutdown.shutdown();
+        self._runner.abort();
     }
 }
 

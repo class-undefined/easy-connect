@@ -86,3 +86,20 @@ verification against every gateway. The implementation uses the observed
 `timequery.csp`, `randtick.csp`, and `getlogoutinfo.csp` sequence, encrypted
 session/nonce format, and named logout reasons. Tests use synthetic responses
 and ephemeral RSA keys; no official JavaScript or session data is redistributed.
+
+## easy-connect connection maintenance (2026-10-12)
+
+The maintenance and recovery implementation was informed by static inspection
+of the installed Sangfor EasyConnect 7.6.7 build 6 desktop Web SDK and the
+`svpnservice` Mach-O, plus historical local L3VPN logs. Xcode llvm-objdump
+provided instruction-level evidence for command heartbeat 3, response 15,
+ICMP construction and recovery paths. No official executable or disassembly
+is redistributed. Root `docs/connection-maintenance.md` records image identity,
+addresses, evidence limits and policy choices.
+
+The already-declared zju-connect v1.1.1 source reference was downloaded to an
+ignored analysis directory and reviewed again for the existing modern TLS
+channel framing. It is not used during the application build or runtime.
+Mapping the official legacy messages onto modern TLS framing is a compatibility
+adaptation and remains subject to live gateway validation. Retry budgets and
+acknowledgement deadlines are project choices, not verified vendor constants.

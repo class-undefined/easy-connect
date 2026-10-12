@@ -329,7 +329,27 @@ impl SpecialTls11Stream {
         verified_https_leaf_sha256: &[u8; 32],
         configured_special_leaf_sha256: Option<&[u8; 32]>,
     ) -> Result<Self> {
+        Self::connect_observed(
+            address,
+            host,
+            timeout,
+            verified_https_leaf_sha256,
+            configured_special_leaf_sha256,
+            |_| Ok(()),
+        )
+    }
+
+    /// Register even a handshaking socket so shutdown can interrupt setup.
+    pub(crate) fn connect_observed(
+        address: SocketAddr,
+        host: &str,
+        timeout: Duration,
+        verified_https_leaf_sha256: &[u8; 32],
+        configured_special_leaf_sha256: Option<&[u8; 32]>,
+        observe: impl FnOnce(&TcpStream) -> Result<()>,
+    ) -> Result<Self> {
         let mut stream = connect_gateway_tcp(address, timeout)?;
+        observe(&stream)?;
         let mut client_random = [0_u8; 32];
         OsRng.fill_bytes(&mut client_random);
         let client_hello = build_special_client_hello(client_random)?;
@@ -458,6 +478,30 @@ impl SpecialTls11Stream {
         Ok(())
     }
 
+    /// Wait for bytes without consuming a partial TLS header or advancing RC4.
+    /// A timed-out record read cannot be resumed safely with read_exact; peek
+    /// lets an idle control channel wait while retaining its cipher state.
+    pub(crate) fn wait_readable(&self, timeout: Duration) -> Result<bool> {
+        let previous = self.stream.read_timeout()?;
+        self.stream
+            .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))?;
+        let result = self.stream.peek(&mut [0_u8; 1]);
+        self.stream.set_read_timeout(previous)?;
+        match result {
+            Ok(0) => Err(Error("VPN transport closed".into())),
+            Ok(_) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn read_application_data(&mut self, maximum: usize) -> Result<Zeroizing<Vec<u8>>> {
         let (content_type, ciphertext) = read_record(&mut self.stream)?;
         if content_type != APPLICATION_DATA {
@@ -476,6 +520,41 @@ impl SpecialTls11Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_peek_and_fragmented_records_preserve_cipher_state() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let mut stream = SpecialTls11Stream {
+            stream: socket,
+            client_cipher: RecordCipher::new([3; 20], [7; 16]),
+            server_cipher: RecordCipher::new([3; 20], [7; 16]),
+        };
+        assert!(!stream.wait_readable(Duration::from_millis(2)).unwrap());
+        assert_eq!(
+            stream.stream.read_timeout().unwrap(),
+            Some(Duration::from_secs(2))
+        );
+        let writer = std::thread::spawn(move || {
+            let mut cipher = RecordCipher::new([3; 20], [7; 16]);
+            let encrypted = cipher.encrypt(APPLICATION_DATA, b"first ack").unwrap();
+            let mut record = Vec::new();
+            write_record(&mut record, APPLICATION_DATA, &encrypted).unwrap();
+            peer.write_all(&record[..1]).unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+            peer.write_all(&record[1..]).unwrap();
+            let encrypted = cipher.encrypt(APPLICATION_DATA, b"second ack").unwrap();
+            write_record(&mut peer, APPLICATION_DATA, &encrypted).unwrap();
+        });
+        assert!(stream.wait_readable(Duration::from_secs(1)).unwrap());
+        assert_eq!(&*stream.read_application_data(128).unwrap(), b"first ack");
+        assert_eq!(&*stream.read_application_data(128).unwrap(), b"second ack");
+        writer.join().unwrap();
+    }
 
     #[test]
     fn prf_is_deterministic_and_label_bound() {
