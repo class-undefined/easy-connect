@@ -463,6 +463,30 @@ fn label(text: &str) -> Div {
         .mb(px(4.))
         .child(text.to_owned())
 }
+// Input::h only affects multiline editors; use Styled::h for a single-line field.
+fn field(title: &'static str, state: &Entity<InputState>) -> Div {
+    div()
+        .w_full()
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .child(
+            div()
+                .h(px(16.))
+                .text_size(px(12.))
+                .text_color(rgb(0x91a2b4))
+                .child(title),
+        )
+        .child(
+            gpui::Styled::h(Input::new(state).small().rounded_none(), px(36.))
+                .w_full()
+                .flex_shrink_0()
+                .px(px(10.))
+                .py(px(6.))
+                .text_size(px(14.)),
+        )
+}
 fn metric(key: &str, value: String) -> Div {
     div()
         .flex_1()
@@ -572,7 +596,7 @@ impl Render for Desktop {
                     .gap(px(12.))
                     .child(
                         div()
-                            .w(px(292.))
+                            .w(px(320.))
                             .bg(rgb(0x18212c))
                             .flex_shrink_0()
                             .p(px(14.))
@@ -582,26 +606,15 @@ impl Render for Desktop {
                             .min_h_0()
                             .id("connection-panel")
                             .overflow_y_scroll()
-                            .child(div().flex().flex_col().gap(px(10.))
+                            .child(div().w_full().flex_shrink_0().flex().flex_col().gap(px(12.))
                             .child(section_heading("连接设置", "01"))
-                            .child(
-                                div()
-                                    .child(label("网关 URL"))
-                                    .child(Input::new(&self.gateway).small().rounded_none()),
-                            )
-                            .child(
-                                div()
-                                    .child(label("账号"))
-                                    .child(Input::new(&self.username).small().rounded_none()),
-                            )
-                            .child(
-                                div()
-                                    .child(label("密码"))
-                                    .child(Input::new(&self.password).small().rounded_none()),
-                            )
+                            .child(field("网关 URL", &self.gateway))
+                            .child(field("账号", &self.username))
+                            .child(field("密码", &self.password))
                             .child(
                                 div()
                                     .id("remember")
+                                    .flex_shrink_0()
                                     .h(px(30.))
                                     .flex()
                                     .items_center()
@@ -662,11 +675,7 @@ impl Render for Desktop {
                                             ),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .child(label("证书 SHA-256（可选）"))
-                                    .child(Input::new(&self.pin).small().rounded_none()),
-                            )
+                            .child(field("证书 SHA-256（可选）", &self.pin))
                             .child(
                                 div()
                                     .flex()
@@ -718,7 +727,7 @@ impl Render for Desktop {
                             )
                             .child(
                                 div()
-                                    .mt_auto()
+                                    .pt(px(4.))
                                     .text_color(rgb(0x718298))
                                     .text_size(px(11.))
                                     .child(
@@ -865,7 +874,7 @@ pub fn run() -> Result<()> {
         theme.colors.ring = rgb(0x6bc9f3).into();
         theme.colors.caret = rgb(0x6bc9f3).into();
         theme.colors.muted_foreground = rgb(0x91a2b4).into();
-        let bounds = Bounds::centered(None, size(px(820.), px(610.)), cx);
+        let bounds = Bounds::centered(None, size(px(860.), px(680.)), cx);
         let result = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
