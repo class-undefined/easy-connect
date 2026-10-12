@@ -28,6 +28,7 @@ use tray_icon::{
 };
 use zeroize::Zeroizing;
 
+mod password;
 mod updates;
 use updates::UpdateState;
 const AUTHOR: &str = "野漫横江";
@@ -38,6 +39,7 @@ gpui::actions!(
         ConnectVpn,
         DisconnectVpn,
         ShowLogs,
+        ShowAbout,
         CheckUpdates,
         QuitApp
     ]
@@ -49,6 +51,7 @@ enum MenuCommand {
     Connect,
     Disconnect,
     Logs,
+    About,
     Updates,
     Quit,
 }
@@ -60,7 +63,7 @@ struct Preferences {
     username: String,
     remember: bool,
     cert_sha256: String,
-    #[serde(default)]
+    #[serde(default = "enabled")]
     auto_login: bool,
     #[serde(default = "enabled")]
     auto_update: bool,
@@ -75,7 +78,7 @@ impl Default for Preferences {
             username: String::new(),
             remember: true,
             cert_sha256: String::new(),
-            auto_login: false,
+            auto_login: true,
             auto_update: true,
         }
     }
@@ -209,6 +212,7 @@ struct Live {
     installed: bool,
     busy: bool,
     quit_ready: bool,
+    replacement_password: Option<Zeroizing<String>>,
 }
 struct Controller {
     live: Arc<Mutex<Live>>,
@@ -280,6 +284,8 @@ struct Desktop {
     last_update: Instant,
     commands: Arc<Mutex<Vec<MenuCommand>>>,
     log_window: Option<AnyWindowHandle>,
+    about_window: Option<AnyWindowHandle>,
+    password_window: Option<AnyWindowHandle>,
     logs_item: MenuItem,
     updates_item: MenuItem,
     controller: Controller,
@@ -382,14 +388,16 @@ impl Desktop {
             password,
             pin,
             remember: preferences.remember,
-            auto_login: preferences.auto_login,
+            auto_login: preferences.auto_login && preferences.remember,
             auto_update: preferences.auto_update,
             advanced: false,
-            startup_pending: preferences.auto_login,
+            startup_pending: preferences.auto_login && preferences.remember,
             updates,
             last_update: Instant::now(),
             commands,
             log_window: None,
+            about_window: None,
+            password_window: None,
             logs_item,
             updates_item,
             controller: Controller::new(),
@@ -424,6 +432,20 @@ impl Desktop {
         Ok(view)
     }
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let changed = self
+            .controller
+            .live
+            .lock()
+            .ok()
+            .and_then(|mut s| s.replacement_password.take());
+        if let Some(secret) = changed {
+            self.password
+                .update(cx, |s, cx| s.set_value(secret.to_string(), window, cx));
+            if let Some(handle) = self.password_window.take() {
+                let _ = handle.update(cx, |_, window, _| window.remove_window());
+            }
+        }
+
         if self
             .controller
             .live
@@ -447,7 +469,12 @@ impl Desktop {
                 .and_then(|s| s.status.clone());
             if let Some(status) = status {
                 self.startup_pending = false;
-                if self.auto_login && self.remember && status.phase == Phase::Disconnected {
+                if self.auto_login
+                    && self.remember
+                    && status.phase == Phase::Disconnected
+                    && !self.username.read(cx).value().is_empty()
+                    && !self.password.read(cx).value().is_empty()
+                {
                     self.connect(window, cx);
                 }
             }
@@ -459,6 +486,9 @@ impl Desktop {
             .unwrap_or_default();
         for command in commands {
             self.menu_command(command, window, cx);
+        }
+        if let Some(handle) = self.password_window {
+            let _ = handle.update(cx, |_, window, _| window.refresh());
         }
         if let Some(logs) = self.log_window {
             let _ = logs.update(cx, |_, _, cx| cx.refresh_windows());
@@ -600,6 +630,7 @@ fn install_menus(queue: Arc<Mutex<Vec<MenuCommand>>>, cx: &mut gpui::App) {
         }};
     }
     register!(ShowMain, MenuCommand::Show);
+    register!(ShowAbout, MenuCommand::About);
     register!(ConnectVpn, MenuCommand::Connect);
     register!(DisconnectVpn, MenuCommand::Disconnect);
     register!(ShowLogs, MenuCommand::Logs);
@@ -611,6 +642,7 @@ fn install_menus(queue: Arc<Mutex<Vec<MenuCommand>>>, cx: &mut gpui::App) {
         gpui::Menu {
             name: "EasyConnect".into(),
             items: vec![
+                gpui::MenuItem::action("关于 EasyConnect", ShowAbout),
                 gpui::MenuItem::action("显示主窗口", ShowMain),
                 gpui::MenuItem::action("检查更新…", CheckUpdates),
                 gpui::MenuItem::separator(),
@@ -685,6 +717,7 @@ impl Desktop {
                 window.activate_window();
             }
             MenuCommand::Logs => self.open_logs(cx),
+            MenuCommand::About => self.open_about(cx),
             MenuCommand::Quit => {
                 self.startup_pending = false;
                 let live = self.controller.live.clone();
@@ -795,6 +828,14 @@ impl Render for Desktop {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let live = self.controller.live.lock().ok();
         let status = live.as_ref().and_then(|s| s.status.clone());
+        let policy = status.as_ref().and_then(|s| {
+            s.password_policy.clone().or_else(|| {
+                s.logs
+                    .iter()
+                    .rev()
+                    .find_map(|line| ec_compat::password::PasswordPolicy::from_log(line))
+            })
+        });
         let busy = live.as_ref().is_some_and(|s| s.busy);
         let installed = live.as_ref().is_some_and(|s| s.installed);
         let notice = live.as_ref().and_then(|s| s.notice.clone());
@@ -944,6 +985,23 @@ impl Render for Desktop {
                                         cx.listener(|view, _, _, cx| view.open_logs(cx)),
                                     )),
                             )
+                            .when_some(policy, |s, policy| {
+                                s.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(8.))
+                                        .text_color(rgb(0xe1ad68))
+                                        .child(policy.message())
+                                        .child(
+                                            button("change-password", "修改密码", true).on_click(
+                                                cx.listener(|view, _, _, cx| {
+                                                    view.open_password(cx)
+                                                }),
+                                            ),
+                                        ),
+                                )
+                            })
                             .when(!installed, |s| {
                                 s.child(button("install", "安装后台服务", false).on_click(
                                     cx.listener(|view, _, _, _| {
@@ -1004,6 +1062,18 @@ impl Render for Desktop {
                                         .border_color(rgb(0x303e4e))
                                         .pt(px(12.))
                                         .child(field("证书 SHA-256", &self.pin))
+                                        .child(
+                                            button(
+                                                "manual-change-password",
+                                                "修改 VPN 密码",
+                                                false,
+                                            )
+                                            .on_click(
+                                                cx.listener(|view, _, _, cx| {
+                                                    view.open_password(cx)
+                                                }),
+                                            ),
+                                        )
                                         .child(button("save-settings", "保存设置", false).on_click(
                                             cx.listener(|view, _, _, cx| view.persist(cx)),
                                         ))
@@ -1051,8 +1121,72 @@ impl Render for Desktop {
                                 s.child(address)
                             }),
                     )
-                    .child(div().text_color(rgb(0x91a2b4)).child(AUTHOR)),
+                    .child(
+                        button("about", "关于", false)
+                            .on_click(cx.listener(|view, _, _, cx| view.open_about(cx))),
+                    ),
             )
+    }
+}
+
+struct AboutView;
+impl Render for AboutView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .bg(rgb(0x10161e))
+            .text_color(rgb(0xdce6ee))
+            .p(px(20.))
+            .flex()
+            .flex_col()
+            .gap(px(14.))
+            .child(
+                div()
+                    .text_size(px(20.))
+                    .font_weight(FontWeight::BOLD)
+                    .child("EasyConnect Rust"),
+            )
+            .child(format!("版本 {} · CLI + GUI", env!("CARGO_PKG_VERSION")))
+            .child(format!("开发者：{AUTHOR} / class-undefined"))
+            .child(
+                button("project", "项目主页", false).on_click(cx.listener(|_, _, _, cx| {
+                    cx.open_url("https://github.com/class-undefined/easy-connect")
+                })),
+            )
+    }
+}
+impl Desktop {
+    fn open_about(&mut self, cx: &mut Context<Self>) {
+        cx.activate(true);
+        if let Some(handle) = self.about_window
+            && handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+        {
+            return;
+        }
+        let bounds = Bounds::centered(None, size(px(350.), px(220.)), cx);
+        match cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("关于 EasyConnect".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            |window, cx| {
+                let view = cx.new(|_| AboutView);
+                cx.new(|cx| Root::new(view, window, cx))
+            },
+        ) {
+            Ok(handle) => self.about_window = Some(handle.into()),
+            Err(error) => {
+                if let Ok(mut live) = self.controller.live.lock() {
+                    live.notice = Some(error.to_string());
+                }
+            }
+        }
     }
 }
 
@@ -1111,11 +1245,11 @@ mod tests {
     fn old_preferences_preserve_credentials_choices_and_gain_update_detection() {
         let preferences: Preferences = serde_json::from_str(r#"{"gateway":"https://example.com","username":"user","remember":false,"cert_sha256":""}"#).unwrap();
         assert!(!preferences.remember);
-        assert!(!preferences.auto_login);
+        assert!(preferences.auto_login);
         assert!(preferences.auto_update);
         let defaults = Preferences::default();
         assert!(defaults.remember);
-        assert!(!defaults.auto_login);
+        assert!(defaults.auto_login);
         assert!(defaults.auto_update);
     }
 }
