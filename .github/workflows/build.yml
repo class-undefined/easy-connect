@@ -33,6 +33,7 @@ jobs:
             arch: aarch64
             os: windows
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
       LZMA_API_STATIC: '1'
@@ -47,6 +48,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}-desktop
+          cache-on-failure: true
       - name: Set up MSVC
         if: matrix.os == 'windows'
         uses: ilammy/msvc-dev-cmd@v1

@@ -318,9 +318,9 @@ impl Desktop {
             .with_menu(Box::new(menu))
             .build()?;
         let window_handle = window.window_handle();
-        window.on_window_should_close(cx, |window, cx| {
+        window.on_window_should_close(cx, |window, _cx| {
             #[cfg(target_os = "macos")]
-            cx.hide();
+            _cx.hide();
             #[cfg(target_os = "windows")]
             show_window(window, false);
             #[cfg(target_os = "macos")]
