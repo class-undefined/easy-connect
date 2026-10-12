@@ -1,0 +1,29 @@
+[package]
+name = "easy-connect"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "GPL-3.0-only AND AGPL-3.0-only"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ec-compat = { path = "vendor/ec-compat" }
+rpassword = "7"
+reqwest = { version = "0.12", default-features = false }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+url = "2"
+zeroize = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+tun-rs = { version = "=2.8.11", features = ["async_tokio"] }
+core-foundation = "0.9"
+system-configuration = "0.6"
+system-configuration-sys = "0.6"
+
+[profile.release]
+lto = "thin"
+strip = true
+

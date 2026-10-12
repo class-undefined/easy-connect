@@ -1,0 +1,7 @@
+This project is provided under GPL-3.0-only AND AGPL-3.0-only.
+
+The complete license texts are included in:
+  vendor/ec-compat/LICENSES/GPL-3.0-only.txt
+  vendor/ec-compat/LICENSES/AGPL-3.0-only.txt
+
+See THIRD_PARTY_NOTICES.md and vendor/ec-compat/LICENSE for provenance.

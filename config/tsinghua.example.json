@@ -1,0 +1,23 @@
+{
+  "base_url": "https://166.111.77.32:4430",
+  "timeout_seconds": 15,
+  "user_agent": "EasyConnect_mac",
+  "tls": {
+    "leaf_sha256": "012fa1b92104a5d514b903a7691e791e890452a499c6980cb590f89016464bb3"
+  },
+  "endpoints": {
+    "discovery": "/por/login_auth.csp?apiversion=1",
+    "password_config": "/public/psw_config?apiversion=1",
+    "password_login": "/por/login_psw.csp?anti_replay=1&encrypt=1&apiversion=1",
+    "session_config": "/por/conf.csp?apiversion=1",
+    "resource_list": "/por/rclist.csp?apiversion=1",
+    "logout": "/por/logout.csp?apiversion=1"
+  },
+  "proxy": {
+    "auto_resources": true,
+    "route_domains": [],
+    "route_ipv4_cidrs": [],
+    "vpn_dns_servers": []
+  },
+  "tunnel": { "mtu": 1400 }
+}

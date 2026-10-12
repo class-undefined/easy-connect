@@ -1,0 +1,55 @@
+HKUST(GZ) Connect licensing
+===========================
+
+This repository is a combined work with code from more than one provenance
+line. It is not offered under a permissive license, and this file does not
+relicense any upstream material.
+
+1. GPL-covered components
+-------------------------
+
+The desktop application, CLI, project documentation, release tooling, and
+other files outside `engine/` are licensed under GPL-3.0-only unless a file or
+third-party notice says otherwise. They include work derived from
+`heeh02/HKUST-GZ-Connect` at commit
+`321cecdc860b96f25c36d99447b5f151bc18c7a2`, which was published under
+GPL-3.0-only.
+
+The complete GPL text is in `LICENSES/GPL-3.0-only.txt`.
+
+2. Engine combined terms
+------------------------
+
+The `engine/` component retains GPL-3.0-only obligations from the project
+above. Its EasyConnect-compatible protocol implementation was also developed
+after review of `Mythologyli/zju-connect` v1.1.1, which is AGPL-3.0-only.
+Because this project cannot establish a reliable expression-level boundary
+between those provenance lines, `engine/` is distributed conservatively under
+the combined expression:
+
+    GPL-3.0-only AND AGPL-3.0-only
+
+GPLv3 section 13 and AGPLv3 section 13 permit GPLv3 and AGPLv3 covered works to
+be combined while each license continues to govern its covered material and
+the AGPL network-interaction requirements apply to the combination as stated
+in those sections.
+
+The complete AGPL text is in `LICENSES/AGPL-3.0-only.txt`.
+
+3. Distribution as a whole
+---------------------------
+
+The packaged application and CLI include the engine. The distribution must
+therefore be handled as a GPLv3/AGPLv3 combined work. Source recipients must
+retain this file, both GNU license texts, `NOTICE.md`, `PROVENANCE.md`, and
+`THIRD_PARTY_NOTICES.md`.
+
+Third-party dependencies remain under their respective licenses. In
+particular, the compiled userspace netstack is BSD-3-Clause and its required
+copyright notice, license conditions, and disclaimer are reproduced in
+`LICENSES/BSD-3-Clause-GeiserX-tailscale-rs.txt` and
+`THIRD_PARTY_NOTICES.md`.
+
+See `PROVENANCE.md` for exact versions and source relationships. This summary
+is provided to make the repository's licensing boundaries explicit; the
+license texts control if this summary conflicts with them.
