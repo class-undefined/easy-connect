@@ -1,6 +1,7 @@
 [package]
 name = "easy-connect"
-version = "0.2.2"
+version = "0.3.0"
+authors = ["野漫横江 (class-undefined)"]
 edition = "2024"
 rust-version = "1.94"
 license = "GPL-3.0-only AND AGPL-3.0-only"

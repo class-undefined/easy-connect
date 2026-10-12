@@ -4,6 +4,8 @@ fn main() {
         winresource::WindowsResource::new()
             .set_icon("assets/icon.ico")
             .set("ProductName", "EasyConnect Rust")
+            .set("CompanyName", "野漫横江")
+            .set("LegalCopyright", "© 野漫横江")
             .set(
                 "FileDescription",
                 "Independent EasyConnect-compatible VPN client",

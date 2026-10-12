@@ -105,7 +105,7 @@ enum Command {
         #[arg(long, conflicts_with = "username")]
         credentials_stdin: bool,
     },
-    /// Connect using macOS TUN (default) or loopback SOCKS5.
+    /// Connect using TUN (default) or loopback SOCKS5.
     Connect {
         #[command(flatten)]
         target: GatewayArgs,

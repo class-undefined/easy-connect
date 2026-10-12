@@ -28,6 +28,7 @@ cat > "$app/Contents/Info.plist" <<EOF
 <key>CFBundleVersion</key><string>$version</string>
 <key>LSMinimumSystemVersion</key><string>12.0</string>
 <key>NSHighResolutionCapable</key><true/>
+<key>NSHumanReadableCopyright</key><string>© 野漫横江</string>
 </dict></plist>
 EOF
 codesign --force --sign - "$app/Contents/MacOS/easy-connect"
