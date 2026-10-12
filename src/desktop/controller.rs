@@ -119,7 +119,7 @@ type Work = Box<dyn FnOnce() -> Result<()> + Send>;
 enum Command {
     Action { pending: Option<Phase>, work: Work },
     Prepare,
-    Quit,
+    Quit(Option<Work>),
 }
 pub(super) struct Controller {
     pub live: Arc<Mutex<Live>>,
@@ -153,19 +153,27 @@ impl Controller {
                         }
                     }
                     Ok(Command::Prepare) => prepare(&state),
-                    Ok(Command::Quit) => {
-                        let result = match service::request(Request::Status) {
-                            Ok(status) if !inactive(&status) => {
-                                disconnect_and_wait(&mut service::request, &mut || {
-                                    std::thread::sleep(RETRY)
-                                })
-                            }
-                            _ => Ok(()),
-                        };
+                    Ok(Command::Quit(install)) => {
+                        let updating = install.is_some();
+                        let result = finish_exit(
+                            &mut service::request,
+                            &mut || std::thread::sleep(RETRY),
+                            install,
+                            service::installed(),
+                        );
                         if let Ok(mut live) = state.lock() {
                             live.quit_ready = result.is_ok();
                             live.quitting = result.is_ok();
-                            live.notice = result.err().map(|e| format!("退出失败：{e:#}"));
+                            live.notice = result.err().map(|e| {
+                                format!(
+                                    "{}：{e:#}",
+                                    if updating {
+                                        "更新安装失败"
+                                    } else {
+                                        "退出失败"
+                                    }
+                                )
+                            });
                         }
                         if state.lock().is_ok_and(|s| s.quit_ready) {
                             break;
@@ -245,16 +253,45 @@ impl Controller {
         }
     }
     pub(super) fn quit(&self) {
+        self.request_quit(None);
+    }
+    pub(super) fn quit_with_install(
+        &self,
+        install: impl FnOnce() -> Result<()> + Send + 'static,
+    ) -> bool {
+        self.request_quit(Some(Box::new(install)))
+    }
+    fn request_quit(&self, install: Option<Work>) -> bool {
         if let Ok(mut live) = self.live.lock()
             && !live.quitting
         {
             live.quitting = true;
-            let _ = self.commands.send(Command::Quit);
+            if self.commands.send(Command::Quit(install)).is_ok() {
+                return true;
+            }
+            live.quitting = false;
+            live.notice = Some("后台任务已停止，请重新打开应用".into());
         }
+        false
     }
 }
 fn current_version(status: &Status) -> bool {
     status.version == env!("CARGO_PKG_VERSION")
+}
+fn finish_exit(
+    request: &mut impl FnMut(Request) -> Result<Status>,
+    sleep: &mut impl FnMut(),
+    install: Option<Work>,
+    installed: bool,
+) -> Result<()> {
+    match request(Request::Status) {
+        Ok(status) if !inactive(&status) => disconnect_and_wait(request, sleep)?,
+        Err(error) if install.is_some() && installed => {
+            return Err(error).context("无法确认 VPN 已断开，暂不安装更新");
+        }
+        _ => {}
+    }
+    install.map_or(Ok(()), |work| work())
 }
 fn prepare(live: &Arc<Mutex<Live>>) {
     if let Ok(mut state) = live.lock() {
@@ -347,6 +384,54 @@ fn ensure_service(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn update_installer_waits_for_disconnect_and_aborts_on_cleanup_failure() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let launched = Arc::new(AtomicBool::new(false));
+        let marker = launched.clone();
+        let mut calls = 0;
+        finish_exit(
+            &mut |_| {
+                calls += 1;
+                assert!(!launched.load(Ordering::Relaxed));
+                Ok(status(
+                    if calls < 3 {
+                        Phase::Stopping
+                    } else {
+                        Phase::Disconnected
+                    },
+                    env!("CARGO_PKG_VERSION"),
+                ))
+            },
+            &mut || {},
+            Some(Box::new(move || {
+                marker.store(true, Ordering::Relaxed);
+                Ok(())
+            })),
+            true,
+        )
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert!(launched.load(Ordering::Relaxed));
+        assert!(
+            finish_exit(
+                &mut |_| Ok(status(Phase::Stopping, env!("CARGO_PKG_VERSION"))),
+                &mut || {},
+                Some(Box::new(|| panic!("installer ran before cleanup"))),
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            finish_exit(
+                &mut |_| bail!("offline"),
+                &mut || {},
+                Some(Box::new(|| panic!("installer ran without status"))),
+                true
+            )
+            .is_err()
+        );
+    }
     fn status(phase: Phase, version: &str) -> Status {
         Status {
             phase,

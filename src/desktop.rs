@@ -314,8 +314,11 @@ impl Desktop {
         }
         let commands = Arc::new(Mutex::new(Vec::new()));
         install_menus(commands.clone(), cx);
-        let updates = Arc::new(Mutex::new(UpdateState::Idle));
-        if preferences.auto_update {
+        let initial_update = updates::initial_state();
+        let should_check =
+            preferences.auto_update && !matches!(initial_update, UpdateState::Failed { .. });
+        let updates = Arc::new(Mutex::new(initial_update));
+        if should_check {
             updates::check(updates.clone());
         }
         let menu = Menu::new();
@@ -414,6 +417,9 @@ impl Desktop {
             }
         }
 
+        if updates::install_if_ready(&self.updates, &self.controller) {
+            self.startup_pending = false;
+        }
         if self
             .controller
             .live
@@ -820,12 +826,8 @@ impl Render for Desktop {
             phase_style(phase)
         };
         let update = self.updates.lock().map(|s| s.clone()).unwrap_or_default();
-        let update_label = match &update {
-            UpdateState::Available { version, .. } => format!("下载 v{version}"),
-            UpdateState::Checking => "检查中…".into(),
-            UpdateState::Current => "已是最新版".into(),
-            _ => format!("v{} · 检查更新", env!("CARGO_PKG_VERSION")),
-        };
+        let update_label = update.label();
+        let manual_update_url = update.manual_url();
         div()
             .size_full()
             .flex()
@@ -851,20 +853,16 @@ impl Render for Desktop {
                             .child("EasyConnect"),
                     )
                     .child(
-                        button(
-                            "updates",
-                            &update_label,
-                            matches!(update, UpdateState::Available { .. }),
-                        )
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            let state = view.updates.lock().map(|s| s.clone()).unwrap_or_default();
-                            if let UpdateState::Available { url, .. } = state {
-                                cx.open_url(&url);
-                            } else {
-                                updates::check(view.updates.clone());
+                        Button::new("updates")
+                            .label(update_label)
+                            .small()
+                            .rounded_none()
+                            .when(update.can_install(), |button| button.primary())
+                            .disabled(update.busy())
+                            .on_click(cx.listener(|view, _, _, _| {
+                                updates::activate(view.updates.clone());
                                 view.last_update = Instant::now();
-                            }
-                        })),
+                            })),
                     ),
             )
             .child(
@@ -1103,15 +1101,29 @@ impl Render for Desktop {
                                 }),
                         )
                     })
+                    .when(update.can_install(), |s| {
+                        s.child(
+                            div()
+                                .mt(px(12.))
+                                .text_color(rgb(0x91a2b4))
+                                .child("一键更新会下载新版、断开 VPN，并安装重启应用。"),
+                        )
+                    })
                     .when_some(notice, |s, notice| {
                         s.child(div().mt(px(12.)).text_color(rgb(0xe1ad68)).child(notice))
                     })
-                    .when(matches!(update, UpdateState::Failed(_)), |s| {
-                        if let UpdateState::Failed(message) = update {
+                    .when(matches!(update, UpdateState::Failed { .. }), |s| {
+                        if let UpdateState::Failed { message, .. } = update {
                             s.child(div().mt(px(12.)).text_color(rgb(0xe1ad68)).child(message))
                         } else {
                             s
                         }
+                    })
+                    .when_some(manual_update_url, |s, url| {
+                        s.child(
+                            button("manual-update", "手动下载安装包", false)
+                                .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url))),
+                        )
                     }),
             )
             .child(
