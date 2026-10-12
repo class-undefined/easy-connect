@@ -8,7 +8,7 @@ default-run = "easy-connect"
 
 [features]
 default = []
-desktop = ["dep:gpui", "dep:gpui-component", "dep:tray-icon", "dep:keyring", "dep:dirs", "dep:raw-window-handle"]
+desktop = ["dep:gpui", "dep:gpui-component", "dep:tray-icon", "dep:keyring", "dep:dirs", "dep:raw-window-handle", "dep:semver"]
 
 [[bin]]
 name = "easy-connect-gui"
@@ -35,6 +35,7 @@ gpui-component = { version = "=0.5.1", optional = true }
 tray-icon = { version = "=0.21.2", optional = true, default-features = false }
 keyring = { version = "=3.6.3", optional = true, features = ["apple-native", "windows-native"] }
 dirs = { version = "6", optional = true }
+semver = { version = "1", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
