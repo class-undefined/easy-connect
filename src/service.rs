@@ -97,10 +97,12 @@ pub fn current_owner() -> Result<String> {
     }
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         let out = Command::new("whoami.exe")
+            .creation_flags(0x08000000)
             .args(["/user", "/fo", "csv", "/nh"])
             .output()?;
-        let text = String::from_utf8(out.stdout)?;
+        let text = String::from_utf8_lossy(&out.stdout);
         let owner = text
             .split('"')
             .find(|s| s.starts_with("S-1-"))

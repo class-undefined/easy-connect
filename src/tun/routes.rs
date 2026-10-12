@@ -216,7 +216,7 @@ impl RouteCommands for SystemRoutes {
     }
     #[cfg(target_os = "windows")]
     fn snapshot(&self) -> Result<Option<BTreeSet<(Cidr, String)>>> {
-        let output=Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-Command","Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore | Select-Object DestinationPrefix,InterfaceAlias | ConvertTo-Json -Compress"]).output()?;
+        let output=Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-Command","[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore | Select-Object DestinationPrefix,InterfaceAlias | ConvertTo-Json -Compress"]).output()?;
         if !output.status.success() {
             bail!("cannot inspect Windows route table");
         }
