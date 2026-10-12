@@ -21,7 +21,9 @@ if [ "$fingerprint" != '16CA7F918F2452512BEC526ECFF8561349493198' ]; then
   echo 'Unexpected macOS signing identity' >&2
   exit 1
 fi
-security add-trusted-cert -r trustRoot -p codeSign -k "$keychain" "$certificate"
+# The user trust domain prompts through SecurityAgent even in CI. The ephemeral
+# runner permits noninteractive admin trust; constrain it to code signing.
+sudo -n security add-trusted-cert -d -r trustRoot -p codeSign -k "$keychain" "$certificate"
 rm -f "$archive"
 printf 'MACOS_SIGNING_KEYCHAIN=%s\n' "$keychain" >> "$GITHUB_ENV"
 printf 'MACOS_SIGNING_IDENTITY=%s\n' "$fingerprint" >> "$GITHUB_ENV"

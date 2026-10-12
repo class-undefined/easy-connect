@@ -74,6 +74,7 @@ jobs:
       - name: Collect dependency licenses
         run: python scripts/collect-licenses.py
       - name: Import macOS signing identity
+        timeout-minutes: 2
         if: matrix.os == 'macos' && github.event_name != 'pull_request'
         env:
           MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
@@ -96,7 +97,7 @@ jobs:
         shell: bash
         run: |
           certificate="$RUNNER_TEMP/easy-connect-signing.pem"
-          if [ -f "$certificate" ]; then security remove-trusted-cert "$certificate" || true; fi
+          if [ -f "$certificate" ]; then sudo -n security remove-trusted-cert -d "$certificate" || true; fi
           security delete-keychain "$RUNNER_TEMP/easy-connect-signing.keychain-db" || true
           rm -f "$RUNNER_TEMP/easy-connect-signing.p12" "$certificate"
       - uses: actions/upload-artifact@v4
