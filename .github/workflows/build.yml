@@ -94,12 +94,16 @@ jobs:
           ./scripts/package-windows.ps1 -Arch '${{ matrix.arch }}' -Version $version
       - name: Remove macOS signing material
         if: always() && matrix.os == 'macos' && github.event_name != 'pull_request'
+        timeout-minutes: 1
         shell: bash
         run: |
-          certificate="$RUNNER_TEMP/easy-connect-signing.pem"
-          if [ -f "$certificate" ]; then sudo -n security remove-trusted-cert -d "$certificate" || true; fi
-          security delete-keychain "$RUNNER_TEMP/easy-connect-signing.keychain-db" || true
-          rm -f "$RUNNER_TEMP/easy-connect-signing.p12" "$certificate"
+          # SecurityAgent may prompt even during cleanup. Remove all private
+          # material directly; the ephemeral VM discards the public trust entry.
+          rm -f "$RUNNER_TEMP/easy-connect-signing.p12" \
+            "$RUNNER_TEMP/easy-connect-signing.pem" \
+            "$RUNNER_TEMP/easy-connect-signing.keychain-db" \
+            "$RUNNER_TEMP/easy-connect-signing.keychain-db-wal" \
+            "$RUNNER_TEMP/easy-connect-signing.keychain-db-shm"
       - uses: actions/upload-artifact@v4
         with:
           name: easy-connect-${{ matrix.os }}-${{ matrix.arch }}

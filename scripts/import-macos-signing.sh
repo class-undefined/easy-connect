@@ -23,7 +23,15 @@ if [ "$fingerprint" != '16CA7F918F2452512BEC526ECFF8561349493198' ]; then
 fi
 # The user trust domain prompts through SecurityAgent even in CI. The ephemeral
 # runner permits noninteractive admin trust; constrain it to code signing.
-sudo -n security add-trusted-cert -d -r trustRoot -p codeSign -k "$keychain" "$certificate"
+sudo -n security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$certificate"
+# Key lookup and certificate-chain lookup use the user search list as well as
+# codesign's explicit --keychain. Preserve the runner's existing keychains.
+existing_keychains=()
+while IFS= read -r entry; do
+  existing_keychains+=("$entry")
+done < <(security list-keychains -d user | sed -E 's/^[[:space:]]*"(.*)"$/\1/')
+security list-keychains -d user -s "$keychain" "${existing_keychains[@]}"
+security find-identity -v -p codesigning "$keychain"
 rm -f "$archive"
 printf 'MACOS_SIGNING_KEYCHAIN=%s\n' "$keychain" >> "$GITHUB_ENV"
 printf 'MACOS_SIGNING_IDENTITY=%s\n' "$fingerprint" >> "$GITHUB_ENV"
