@@ -20,13 +20,38 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tray_icon::{
     TrayIcon, TrayIconBuilder,
     menu::{Menu, MenuEvent, MenuItem},
 };
 use zeroize::Zeroizing;
+
+mod updates;
+use updates::UpdateState;
+const AUTHOR: &str = "野漫横江";
+gpui::actions!(
+    easy_connect,
+    [
+        ShowMain,
+        ConnectVpn,
+        DisconnectVpn,
+        ShowLogs,
+        CheckUpdates,
+        QuitApp
+    ]
+);
+
+#[derive(Clone, Copy)]
+enum MenuCommand {
+    Show,
+    Connect,
+    Disconnect,
+    Logs,
+    Updates,
+    Quit,
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,14 +60,23 @@ struct Preferences {
     username: String,
     remember: bool,
     cert_sha256: String,
+    #[serde(default)]
+    auto_login: bool,
+    #[serde(default = "enabled")]
+    auto_update: bool,
+}
+fn enabled() -> bool {
+    true
 }
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             gateway: "https://166.111.77.32:4430/".into(),
             username: String::new(),
-            remember: false,
+            remember: true,
             cert_sha256: String::new(),
+            auto_login: false,
+            auto_update: true,
         }
     }
 }
@@ -62,7 +96,9 @@ fn vault(preferences: &Preferences) -> Result<keyring::Entry> {
 }
 fn save(preferences: &Preferences, password: &str) -> Result<()> {
     if preferences.remember {
-        vault(preferences)?.set_password(password)?;
+        if !preferences.username.trim().is_empty() && !password.is_empty() {
+            vault(preferences)?.set_password(password)?;
+        }
     } else {
         match vault(preferences)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => {}
@@ -172,6 +208,7 @@ struct Live {
     notice: Option<String>,
     installed: bool,
     busy: bool,
+    quit_ready: bool,
 }
 struct Controller {
     live: Arc<Mutex<Live>>,
@@ -212,10 +249,7 @@ impl Controller {
             let result = work();
             if let Ok(mut state) = live.lock() {
                 state.busy = false;
-                state.notice = Some(match result {
-                    Ok(()) => "操作已提交".into(),
-                    Err(error) => error.to_string(),
-                });
+                state.notice = result.err().map(|error| error.to_string());
             }
         });
     }
@@ -238,13 +272,22 @@ struct Desktop {
     password: Entity<InputState>,
     pin: Entity<InputState>,
     remember: bool,
+    auto_login: bool,
+    auto_update: bool,
+    advanced: bool,
+    startup_pending: bool,
+    updates: Arc<Mutex<UpdateState>>,
+    last_update: Instant,
+    commands: Arc<Mutex<Vec<MenuCommand>>>,
+    log_window: Option<AnyWindowHandle>,
+    logs_item: MenuItem,
+    updates_item: MenuItem,
     controller: Controller,
     tray: TrayIcon,
     show: MenuItem,
     disconnect: MenuItem,
     quit: MenuItem,
     poll: Option<Task<()>>,
-    window: AnyWindowHandle,
 }
 fn tray_icon(connected: bool) -> Result<tray_icon::Icon> {
     let mut pixels = vec![0_u8; 18 * 18 * 4];
@@ -287,9 +330,7 @@ impl Desktop {
                 .placeholder("VPN 密码")
                 .masked(true)
         });
-        let pin = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("默认校验证书；自签名网关可填写 SHA-256")
-        });
+        let pin = cx.new(|cx| InputState::new(window, cx).placeholder("可选"));
         gateway.update(cx, |s, cx| {
             s.set_value(preferences.gateway.clone(), window, cx)
         });
@@ -306,11 +347,19 @@ impl Desktop {
             let secret = Zeroizing::new(secret);
             password.update(cx, |s, cx| s.set_value(secret.to_string(), window, cx));
         }
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        install_menus(commands.clone(), cx);
+        let updates = Arc::new(Mutex::new(UpdateState::Idle));
+        if preferences.auto_update {
+            updates::check(updates.clone());
+        }
         let menu = Menu::new();
         let show = MenuItem::new("显示 EasyConnect", true, None);
         let disconnect = MenuItem::new("断开隧道", true, None);
         let quit = MenuItem::new("退出", true, None);
-        menu.append_items(&[&show, &disconnect, &quit])?;
+        let logs_item = MenuItem::new("事件日志", true, None);
+        let updates_item = MenuItem::new("检查更新", true, None);
+        menu.append_items(&[&show, &disconnect, &logs_item, &updates_item, &quit])?;
         let tray = TrayIconBuilder::new()
             .with_icon(tray_icon(false)?)
             .with_icon_as_template(cfg!(target_os = "macos"))
@@ -333,13 +382,22 @@ impl Desktop {
             password,
             pin,
             remember: preferences.remember,
+            auto_login: preferences.auto_login,
+            auto_update: preferences.auto_update,
+            advanced: false,
+            startup_pending: preferences.auto_login,
+            updates,
+            last_update: Instant::now(),
+            commands,
+            log_window: None,
+            logs_item,
+            updates_item,
             controller: Controller::new(),
             tray,
             show,
             disconnect,
             quit,
             poll: None,
-            window: window_handle,
         };
         view.poll = Some(cx.spawn(async move |view, cx| {
             loop {
@@ -347,9 +405,15 @@ impl Desktop {
                     .timer(Duration::from_millis(250))
                     .await;
                 if view
-                    .update(cx, |view, cx| {
-                        view.tick(cx);
-                        cx.notify();
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("window closed"))
+                    .and_then(|view| {
+                        window_handle.update(cx, |_, window, cx| {
+                            view.update(cx, |view, cx| {
+                                view.tick(window, cx);
+                                cx.notify();
+                            });
+                        })
                     })
                     .is_err()
                 {
@@ -359,7 +423,47 @@ impl Desktop {
         }));
         Ok(view)
     }
-    fn tick(&mut self, cx: &mut Context<Self>) {
+    fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .controller
+            .live
+            .lock()
+            .ok()
+            .is_some_and(|s| s.quit_ready)
+        {
+            cx.quit();
+            return;
+        }
+        if self.auto_update && self.last_update.elapsed() >= Duration::from_secs(12 * 60 * 60) {
+            updates::check(self.updates.clone());
+            self.last_update = Instant::now();
+        }
+        if self.startup_pending {
+            let status = self
+                .controller
+                .live
+                .lock()
+                .ok()
+                .and_then(|s| s.status.clone());
+            if let Some(status) = status {
+                self.startup_pending = false;
+                if self.auto_login && self.remember && status.phase == Phase::Disconnected {
+                    self.connect(window, cx);
+                }
+            }
+        }
+        let commands = self
+            .commands
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default();
+        for command in commands {
+            self.menu_command(command, window, cx);
+        }
+        if let Some(logs) = self.log_window {
+            let _ = logs.update(cx, |_, _, cx| cx.refresh_windows());
+        }
+
         let connected = self
             .controller
             .live
@@ -377,18 +481,21 @@ impl Desktop {
         }));
         self.disconnect.set_enabled(connected);
         while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if event.id == *self.show.id() {
-                cx.activate(true);
-                let _ = self.window.update(cx, |_, window, _| {
-                    #[cfg(target_os = "windows")]
-                    show_window(window, true);
-                    window.activate_window();
-                });
+            let command = if event.id == *self.show.id() {
+                Some(MenuCommand::Show)
             } else if event.id == *self.disconnect.id() {
-                self.controller.disconnect();
+                Some(MenuCommand::Disconnect)
+            } else if event.id == *self.logs_item.id() {
+                Some(MenuCommand::Logs)
+            } else if event.id == *self.updates_item.id() {
+                Some(MenuCommand::Updates)
             } else if event.id == *self.quit.id() {
-                let _ = service::request(Request::Disconnect);
-                cx.quit();
+                Some(MenuCommand::Quit)
+            } else {
+                None
+            };
+            if let Some(command) = command {
+                self.menu_command(command, window, cx);
             }
         }
     }
@@ -400,12 +507,14 @@ impl Desktop {
             gateway: self.gateway.read(cx).value().to_string(),
             username: self.username.read(cx).value().to_string(),
             remember: self.remember,
+            auto_login: self.auto_login,
+            auto_update: self.auto_update,
             cert_sha256: self.pin.read(cx).value().to_string(),
         };
         let password = Zeroizing::new(self.password.read(cx).value().to_string());
         if !service::installed() {
             if let Ok(mut s) = self.controller.live.lock() {
-                s.notice = Some("请先安装后台服务；管理员授权仅用于首次安装或服务更新".into());
+                s.notice = Some("请先安装后台服务".into());
             }
             cx.notify();
             return;
@@ -437,32 +546,6 @@ impl Desktop {
     }
 }
 
-fn section_heading(title: &'static str, number: &'static str) -> Div {
-    div()
-        .h(px(26.))
-        .flex_shrink_0()
-        .flex()
-        .items_center()
-        .justify_between()
-        .border_b_1()
-        .border_color(rgb(0x303e4e))
-        .text_size(px(13.))
-        .font_weight(FontWeight::SEMIBOLD)
-        .child(title)
-        .child(
-            div()
-                .text_size(px(10.))
-                .text_color(rgb(0x91a2b4))
-                .child(number),
-        )
-}
-fn label(text: &str) -> Div {
-    div()
-        .text_size(px(11.))
-        .text_color(rgb(0x91a2b4))
-        .mb(px(4.))
-        .child(text.to_owned())
-}
 // Input::h only affects multiline editors; use Styled::h for a single-line field.
 fn field(title: &'static str, state: &Entity<InputState>) -> Div {
     div()
@@ -487,23 +570,6 @@ fn field(title: &'static str, state: &Entity<InputState>) -> Div {
                 .text_size(px(14.)),
         )
 }
-fn metric(key: &str, value: String) -> Div {
-    div()
-        .flex_1()
-        .min_w_0()
-        .bg(rgb(0x18212c))
-        .border_1()
-        .border_color(rgb(0x303e4e))
-        .p(px(10.))
-        .child(label(key))
-        .child(
-            div()
-                .font_family(if cfg!(windows) { "Consolas" } else { "Menlo" })
-                .text_size(px(16.))
-                .text_color(rgb(0xdce6ee))
-                .child(value),
-        )
-}
 fn button(id: &'static str, text: &str, primary: bool) -> Stateful<Div> {
     div()
         .id(id)
@@ -522,6 +588,209 @@ fn button(id: &'static str, text: &str, primary: bool) -> Stateful<Div> {
         .active(|s| s.bg(rgb(0x172633)))
         .child(text.to_owned())
 }
+fn install_menus(queue: Arc<Mutex<Vec<MenuCommand>>>, cx: &mut gpui::App) {
+    macro_rules! register {
+        ($action:ty, $command:expr) => {{
+            let queue = queue.clone();
+            cx.on_action(move |_: &$action, _| {
+                if let Ok(mut q) = queue.lock() {
+                    q.push($command);
+                }
+            });
+        }};
+    }
+    register!(ShowMain, MenuCommand::Show);
+    register!(ConnectVpn, MenuCommand::Connect);
+    register!(DisconnectVpn, MenuCommand::Disconnect);
+    register!(ShowLogs, MenuCommand::Logs);
+    register!(CheckUpdates, MenuCommand::Updates);
+    register!(QuitApp, MenuCommand::Quit);
+    cx.bind_keys([gpui::KeyBinding::new("secondary-q", QuitApp, None)]);
+    #[cfg(target_os = "macos")]
+    cx.set_menus(vec![
+        gpui::Menu {
+            name: "EasyConnect".into(),
+            items: vec![
+                gpui::MenuItem::action("显示主窗口", ShowMain),
+                gpui::MenuItem::action("检查更新…", CheckUpdates),
+                gpui::MenuItem::separator(),
+                gpui::MenuItem::action("退出 EasyConnect", QuitApp),
+            ],
+        },
+        gpui::Menu {
+            name: "连接".into(),
+            items: vec![
+                gpui::MenuItem::action("连接", ConnectVpn),
+                gpui::MenuItem::action("断开", DisconnectVpn),
+            ],
+        },
+        gpui::Menu {
+            name: "编辑".into(),
+            items: vec![
+                gpui::MenuItem::action("撤销", gpui_component::input::Undo),
+                gpui::MenuItem::action("重做", gpui_component::input::Redo),
+                gpui::MenuItem::separator(),
+                gpui::MenuItem::action("剪切", gpui_component::input::Cut),
+                gpui::MenuItem::action("复制", gpui_component::input::Copy),
+                gpui::MenuItem::action("粘贴", gpui_component::input::Paste),
+                gpui::MenuItem::action("全选", gpui_component::input::SelectAll),
+            ],
+        },
+        gpui::Menu {
+            name: "窗口".into(),
+            items: vec![
+                gpui::MenuItem::action("主窗口", ShowMain),
+                gpui::MenuItem::action("事件日志", ShowLogs),
+            ],
+        },
+    ]);
+}
+
+impl Desktop {
+    fn preferences(&self, cx: &Context<Self>) -> Preferences {
+        Preferences {
+            gateway: self.gateway.read(cx).value().to_string(),
+            username: self.username.read(cx).value().to_string(),
+            remember: self.remember,
+            cert_sha256: self.pin.read(cx).value().to_string(),
+            auto_login: self.auto_login,
+            auto_update: self.auto_update,
+        }
+    }
+    fn persist(&self, cx: &Context<Self>) {
+        let preferences = self.preferences(cx);
+        let password = Zeroizing::new(self.password.read(cx).value().to_string());
+        self.controller
+            .action(move || save(&preferences, &password));
+    }
+    fn menu_command(&mut self, command: MenuCommand, window: &mut Window, cx: &mut Context<Self>) {
+        match command {
+            MenuCommand::Show => {
+                cx.activate(true);
+                #[cfg(target_os = "windows")]
+                show_window(window, true);
+                window.activate_window();
+            }
+            MenuCommand::Connect => self.connect(window, cx),
+            MenuCommand::Disconnect => {
+                self.startup_pending = false;
+                self.controller.disconnect();
+            }
+            MenuCommand::Updates => {
+                self.last_update = Instant::now();
+                updates::check(self.updates.clone());
+                cx.activate(true);
+                #[cfg(target_os = "windows")]
+                show_window(window, true);
+                window.activate_window();
+            }
+            MenuCommand::Logs => self.open_logs(cx),
+            MenuCommand::Quit => {
+                self.startup_pending = false;
+                let live = self.controller.live.clone();
+                std::thread::spawn(move || {
+                    let _ = service::request(Request::Disconnect);
+                    if let Ok(mut s) = live.lock() {
+                        s.quit_ready = true;
+                    }
+                });
+            }
+        }
+    }
+    fn open_logs(&mut self, cx: &mut Context<Self>) {
+        cx.activate(true);
+        if let Some(handle) = self.log_window
+            && handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+        {
+            return;
+        }
+        let live = self.controller.live.clone();
+        let bounds = Bounds::centered(None, size(px(700.), px(420.)), cx);
+        match cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(420.), px(390.))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("EasyConnect · 事件日志".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            |window, cx| {
+                let logs = cx.new(|_| LogView { live });
+                cx.new(|cx| Root::new(logs, window, cx))
+            },
+        ) {
+            Ok(handle) => self.log_window = Some(handle.into()),
+            Err(error) => {
+                if let Ok(mut live) = self.controller.live.lock() {
+                    live.notice = Some(error.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn phase_style(phase: Option<Phase>) -> (&'static str, u32) {
+    match phase {
+        Some(Phase::Connected) => ("已连接", 0x72cfa7),
+        Some(Phase::Connecting) => ("连接中", 0xe1ad68),
+        Some(Phase::Stopping) => ("正在断开", 0xe1ad68),
+        Some(Phase::Failed) => ("连接失败", 0xf87171),
+        _ => ("未连接", 0x91a2b4),
+    }
+}
+fn toggle(id: &'static str, text: &'static str, checked: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap(px(7.))
+        .h(px(26.))
+        .cursor_pointer()
+        .hover(|s| s.text_color(rgb(0x6bc9f3)))
+        .child(
+            div()
+                .size(px(12.))
+                .border_1()
+                .border_color(rgb(if checked { 0x6bc9f3 } else { 0x546475 }))
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(checked, |s| s.child(div().size(px(6.)).bg(rgb(0x6bc9f3)))),
+        )
+        .child(text)
+}
+struct LogView {
+    live: Arc<Mutex<Live>>,
+}
+impl Render for LogView {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let logs = self
+            .live
+            .lock()
+            .ok()
+            .and_then(|s| s.status.as_ref().map(|s| s.logs.clone()))
+            .unwrap_or_default();
+        div()
+            .size_full()
+            .bg(rgb(0x10161e))
+            .text_color(rgb(0xdce6ee))
+            .child(
+                div()
+                    .id("event-log")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .p(px(12.))
+                    .font_family(if cfg!(windows) { "Consolas" } else { "Menlo" })
+                    .text_size(px(12.))
+                    .when(logs.is_empty(), |s| s.child("暂无日志"))
+                    .children(logs.into_iter().map(|line| div().mb(px(5.)).child(line))),
+            )
+    }
+}
 impl Render for Desktop {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let live = self.controller.live.lock().ok();
@@ -530,333 +799,263 @@ impl Render for Desktop {
         let installed = live.as_ref().is_some_and(|s| s.installed);
         let notice = live.as_ref().and_then(|s| s.notice.clone());
         drop(live);
-        let phase = status.as_ref().map(|s| s.phase);
-        let (text, color) = match phase {
-            Some(Phase::Connected) => ("已连接", 0x6bc9f3),
-            Some(Phase::Connecting) => ("连接中", 0xe8b64c),
-            Some(Phase::Stopping) => ("正在断开", 0xe8b64c),
-            Some(Phase::Failed) => ("连接失败", 0xf87171),
-            _ => ("未连接", 0x8a98a8),
-        };
-        let log = status
+        let (state, color) = phase_style(status.as_ref().map(|s| s.phase));
+        let connected = status
             .as_ref()
-            .map(|s| s.logs.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
+            .is_some_and(|s| matches!(s.phase, Phase::Connected | Phase::Connecting));
+        let update = self.updates.lock().map(|s| s.clone()).unwrap_or_default();
+        let update_label = match &update {
+            UpdateState::Available { version, .. } => format!("下载 v{version}"),
+            UpdateState::Checking => "检查中…".into(),
+            UpdateState::Current => "已是最新版".into(),
+            _ => format!("v{} · 检查更新", env!("CARGO_PKG_VERSION")),
+        };
         div()
             .size_full()
+            .flex()
+            .flex_col()
             .bg(rgb(0x10161e))
             .text_color(rgb(0xdce6ee))
             .text_size(px(12.))
-            .flex()
-            .flex_col()
             .child(
                 div()
-                    .h(px(54.))
+                    .h(px(46.))
                     .flex_shrink_0()
-                    .bg(rgb(0x18212b))
                     .px(px(16.))
-                    .border_b_1()
-                    .border_color(rgb(0x303e4e))
                     .flex()
                     .items_center()
                     .justify_between()
+                    .bg(rgb(0x18212c))
+                    .border_b_1()
+                    .border_color(rgb(0x303e4e))
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(px(10.))
-                            .child(
-                                div()
-                                    .text_size(px(17.))
-                                    .font_weight(FontWeight::BOLD)
-                                    .child("EasyConnect"),
-                            )
-                            .child(div().text_color(rgb(0x6f8297)).child("隧道控制台")),
+                            .text_size(px(18.))
+                            .font_weight(FontWeight::BOLD)
+                            .child("EasyConnect"),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .px(px(10.))
-                            .py(px(5.))
-                            .bg(rgb(0x202c39))
-                            .border_1()
-                            .border_color(rgb(0x303e4e))
-                            .child(div().size(px(6.)).bg(rgb(color)))
-                            .child(div().text_color(rgb(color)).child(text)),
+                        button(
+                            "updates",
+                            &update_label,
+                            matches!(update, UpdateState::Available { .. }),
+                        )
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            let state = view.updates.lock().map(|s| s.clone()).unwrap_or_default();
+                            if let UpdateState::Available { url, .. } = state {
+                                cx.open_url(&url);
+                            } else {
+                                updates::check(view.updates.clone());
+                                view.last_update = Instant::now();
+                            }
+                        })),
                     ),
             )
             .child(
                 div()
-                    .flex()
+                    .id("connection-form")
                     .flex_1()
                     .min_h_0()
-                    .p(px(12.))
-                    .gap(px(12.))
+                    .overflow_y_scroll()
+                    .p(px(16.))
                     .child(
                         div()
-                            .w(px(320.))
-                            .bg(rgb(0x18212c))
-                            .flex_shrink_0()
-                            .p(px(14.))
-                            .border_1()
-                            .border_color(rgb(0x303e4e))
+                            .w_full()
                             .flex()
-                            .min_h_0()
-                            .id("connection-panel")
-                            .overflow_y_scroll()
-                            .child(div().w_full().flex_shrink_0().flex().flex_col().gap(px(12.))
-                            .child(section_heading("连接设置", "01"))
+                            .flex_col()
+                            .gap(px(12.))
                             .child(field("网关 URL", &self.gateway))
                             .child(field("账号", &self.username))
                             .child(field("密码", &self.password))
                             .child(
                                 div()
-                                    .id("remember")
-                                    .flex_shrink_0()
-                                    .h(px(30.))
                                     .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .border_b_1()
-                                    .border_color(rgb(0x273341))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(0x202c39)))
-                                    .on_click(cx.listener(|view, _, _, cx| {
-                                        if view.controller.live.lock().ok().is_some_and(|s| s.busy)
-                                        {
-                                            return;
-                                        }
-                                        view.remember = !view.remember;
-                                        if !view.remember {
-                                            view.controller.action(|| {
-                                                if let Ok(path) = preferences_path()
-                                                    && let Ok(bytes) = std::fs::read(path)
-                                                    && let Ok(mut preferences) =
-                                                        serde_json::from_slice::<Preferences>(
-                                                            &bytes,
-                                                        )
-                                                {
-                                                    preferences.remember = false;
-                                                    save(&preferences, "")?;
-                                                }
-                                                Ok(())
-                                            });
-                                        }
-                                        cx.notify();
-                                    }))
-                                    .child("记住密码")
+                                    .gap(px(22.))
+                                    .child(toggle("remember", "记住密码", self.remember).on_click(
+                                        cx.listener(|view, _, _, cx| {
+                                            if view
+                                                .controller
+                                                .live
+                                                .lock()
+                                                .ok()
+                                                .is_some_and(|s| s.busy)
+                                            {
+                                                return;
+                                            }
+                                            view.remember = !view.remember;
+                                            if !view.remember {
+                                                view.auto_login = false;
+                                                view.startup_pending = false;
+                                            }
+                                            view.persist(cx);
+                                            cx.notify();
+                                        }),
+                                    ))
                                     .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(8.))
-                                            .text_size(px(11.))
-                                            .text_color(rgb(0x91a2b4))
-                                            .child("系统凭据存储")
-                                            .child(
-                                                div()
-                                                    .size(px(12.))
-                                                    .border_1()
-                                                    .border_color(rgb(if self.remember {
-                                                        0x6bc9f3
-                                                    } else {
-                                                        0x546475
-                                                    }))
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .when(self.remember, |s| {
-                                                        s.child(
-                                                            div().size(px(6.)).bg(rgb(0x6bc9f3)),
-                                                        )
-                                                    }),
-                                            ),
+                                        toggle("auto-login", "启动时自动登录", self.auto_login)
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                if view
+                                                    .controller
+                                                    .live
+                                                    .lock()
+                                                    .ok()
+                                                    .is_some_and(|s| s.busy)
+                                                {
+                                                    return;
+                                                }
+                                                view.auto_login = !view.auto_login;
+                                                if view.auto_login {
+                                                    view.remember = true;
+                                                }
+                                                view.persist(cx);
+                                                cx.notify();
+                                            })),
                                     ),
                             )
-                            .child(field("证书 SHA-256（可选）", &self.pin))
                             .child(
                                 div()
                                     .flex()
-                                    .gap(px(6.))
+                                    .gap(px(8.))
                                     .child(
                                         button(
                                             "connect",
-                                            if busy { "处理中…" } else { "连接隧道" },
+                                            if busy {
+                                                "处理中…"
+                                            } else if connected {
+                                                "断开连接"
+                                            } else {
+                                                "连接"
+                                            },
                                             true,
                                         )
                                         .flex_1()
                                         .on_click(
-                                            cx.listener(|view, _, window, cx| {
-                                                view.connect(window, cx)
+                                            cx.listener(move |view, _, window, cx| {
+                                                if connected {
+                                                    view.startup_pending = false;
+                                                    view.controller.disconnect();
+                                                } else {
+                                                    view.connect(window, cx);
+                                                }
                                             }),
                                         ),
                                     )
-                                    .child(button("disconnect", "断开", false).on_click(
-                                        cx.listener(|view, _, _, _| view.controller.disconnect()),
+                                    .child(button("logs", "日志", false).on_click(
+                                        cx.listener(|view, _, _, cx| view.open_logs(cx)),
                                     )),
                             )
+                            .when(!installed, |s| {
+                                s.child(button("install", "安装后台服务", false).on_click(
+                                    cx.listener(|view, _, _, _| {
+                                        view.controller.action(install_service)
+                                    }),
+                                ))
+                            })
                             .child(
                                 div()
-                                    .border_t_1()
-                                    .border_color(rgb(0x303e4e))
-                                    .pt(px(12.))
-                                    .child(label("权限服务"))
-                                    .child(div().mb(px(8.)).child(if installed {
-                                        "已安装 · 后续连接无需提权"
-                                    } else {
-                                        "未安装 · 首次需管理员授权"
-                                    }))
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        toggle("auto-update", "自动检查更新", self.auto_update)
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                if view
+                                                    .controller
+                                                    .live
+                                                    .lock()
+                                                    .ok()
+                                                    .is_some_and(|s| s.busy)
+                                                {
+                                                    return;
+                                                }
+                                                view.auto_update = !view.auto_update;
+                                                if view.auto_update {
+                                                    updates::check(view.updates.clone());
+                                                }
+                                                view.persist(cx);
+                                                cx.notify();
+                                            })),
+                                    )
                                     .child(
                                         button(
-                                            "install",
-                                            if installed {
-                                                "更新后台服务"
+                                            "advanced",
+                                            if self.advanced {
+                                                "收起高级设置"
                                             } else {
-                                                "安装后台服务"
+                                                "高级设置"
                                             },
                                             false,
                                         )
                                         .on_click(
-                                            cx.listener(|view, _, _, _| {
-                                                view.controller.action(install_service)
+                                            cx.listener(|view, _, _, cx| {
+                                                view.advanced = !view.advanced;
+                                                cx.notify();
                                             }),
                                         ),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .pt(px(4.))
-                                    .text_color(rgb(0x718298))
-                                    .text_size(px(11.))
-                                    .child(
-                                        "TUN / IPv4 / TCP · UDP · ICMP\n资源网段与 DNS 从网关获取",
-                                    ),
-                            )) ,
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px(10.))
-                            .child(section_heading("隧道状态", "02"))
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap(px(8.))
-                                    .child(metric(
-                                        "虚拟地址",
-                                        status
-                                            .as_ref()
-                                            .and_then(|s| s.address.clone())
-                                            .unwrap_or_else(|| "—".into()),
-                                    ))
-                                    .child(metric(
-                                        "网络接口",
-                                        status
-                                            .as_ref()
-                                            .and_then(|s| s.interface.clone())
-                                            .unwrap_or_else(|| "—".into()),
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap(px(8.))
-                                    .child(metric(
-                                        "资源 / 组",
-                                        status
-                                            .as_ref()
-                                            .map(|s| format!("{} / {}", s.resources, s.groups))
-                                            .unwrap_or_else(|| "0 / 0".into()),
-                                    ))
-                                    .child(metric(
-                                        "路由",
-                                        status
-                                            .as_ref()
-                                            .map(|s| s.routes.to_string())
-                                            .unwrap_or_else(|| "0".into()),
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .text_color(rgb(if notice.is_some() {
-                                        0xe8b64c
-                                    } else {
-                                        0x91a2b4
-                                    }))
-                                    .child(notice.unwrap_or_else(|| {
-                                        "首次安装后台服务后，使用 URL 和账号密码即可连接。".into()
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .border_1()
-                                    .border_color(rgb(0x303e4e))
-                                    .bg(rgb(0x121b25))
-                                    .flex_1()
-                                    .min_h_0()
-                                    .flex()
-                                    .flex_col()
-                                    .child(
-                                        div()
-                                            .px(px(10.))
-                                            .py(px(6.))
-                                            .border_b_1()
-                                            .border_color(rgb(0x303e4e))
-                                            .bg(rgb(0x18212c))
-                                            .flex()
-                                            .justify_between()
-                                            .child("事件日志")
-                                            .child(div().text_color(rgb(0x91a2b4)).child("LIVE")),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("logs")
-                                            .flex_1()
-                                            .min_h_0()
-                                            .overflow_y_scroll()
-                                            .p(px(10.))
-                                            .font_family(if cfg!(windows) {
-                                                "Consolas"
-                                            } else {
-                                                "Menlo"
-                                            })
-                                            .text_size(px(11.))
-                                            .children(
-                                                log.into_iter().map(|s| div().mb(px(4.)).child(s)),
-                                            ),
-                                    ),
-                            ),
+                            .when(self.advanced, |s| {
+                                s.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(12.))
+                                        .border_t_1()
+                                        .border_color(rgb(0x303e4e))
+                                        .pt(px(12.))
+                                        .child(field("证书 SHA-256", &self.pin))
+                                        .child(button("save-settings", "保存设置", false).on_click(
+                                            cx.listener(|view, _, _, cx| view.persist(cx)),
+                                        ))
+                                        .when(installed, |s| {
+                                            s.child(
+                                                button("update-service", "更新后台服务", false)
+                                                    .on_click(cx.listener(|view, _, _, _| {
+                                                        view.controller.action(install_service)
+                                                    })),
+                                            )
+                                        }),
+                                )
+                            })
+                            .when_some(notice, |s, notice| {
+                                s.child(div().text_color(rgb(0xe1ad68)).child(notice))
+                            })
+                            .when(matches!(update, UpdateState::Failed(_)), |s| {
+                                if let UpdateState::Failed(message) = update {
+                                    s.child(div().text_color(rgb(0xe1ad68)).child(message))
+                                } else {
+                                    s
+                                }
+                            }),
                     ),
             )
             .child(
                 div()
-                    .h(px(30.))
+                    .h(px(32.))
                     .flex_shrink_0()
-                    .bg(rgb(0x151e28))
                     .px(px(12.))
-                    .border_t_1()
-                    .border_color(rgb(0x303e4e))
                     .flex()
                     .items_center()
                     .justify_between()
-                    .text_size(px(10.))
-                    .text_color(rgb(0x91a2b4))
-                    .child(format!(
-                        "{}  /  第三方 VPN 客户端",
-                        if cfg!(windows) { "WINDOWS" } else { "macOS" }
-                    ))
-                    .child(format!(
-                        "v{}  ·  关闭窗口保持连接  ·  托盘退出会断开",
-                        env!("CARGO_PKG_VERSION")
-                    )),
+                    .bg(rgb(0x18212c))
+                    .border_t_1()
+                    .border_color(rgb(0x303e4e))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(div().size(px(7.)).bg(rgb(color)))
+                            .child(div().text_color(rgb(color)).child(state))
+                            .when_some(status.and_then(|s| s.address), |s, address| {
+                                s.child(address)
+                            }),
+                    )
+                    .child(div().text_color(rgb(0x91a2b4)).child(AUTHOR)),
             )
     }
 }
+
 pub fn run() -> Result<()> {
     Application::new().run(|cx| {
         gpui_component::init(cx);
@@ -874,10 +1073,11 @@ pub fn run() -> Result<()> {
         theme.colors.ring = rgb(0x6bc9f3).into();
         theme.colors.caret = rgb(0x6bc9f3).into();
         theme.colors.muted_foreground = rgb(0x91a2b4).into();
-        let bounds = Bounds::centered(None, size(px(860.), px(680.)), cx);
+        let bounds = Bounds::centered(None, size(px(440.), px(440.)), cx);
         let result = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(420.), px(390.))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("EasyConnect".into()),
                     ..Default::default()
@@ -906,5 +1106,16 @@ mod tests {
         let value = serde_json::to_value(Preferences::default()).unwrap();
         assert!(value.get("password").is_none());
         assert!(serde_json::from_str::<Preferences>(r#"{"gateway":"https://example.com","username":"u","remember":true,"cert_sha256":"","password":"secret"}"#).is_err());
+    }
+    #[test]
+    fn old_preferences_preserve_credentials_choices_and_gain_update_detection() {
+        let preferences: Preferences = serde_json::from_str(r#"{"gateway":"https://example.com","username":"user","remember":false,"cert_sha256":""}"#).unwrap();
+        assert!(!preferences.remember);
+        assert!(!preferences.auto_login);
+        assert!(preferences.auto_update);
+        let defaults = Preferences::default();
+        assert!(defaults.remember);
+        assert!(!defaults.auto_login);
+        assert!(defaults.auto_update);
     }
 }
