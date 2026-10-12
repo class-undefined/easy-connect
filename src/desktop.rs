@@ -437,24 +437,46 @@ impl Desktop {
     }
 }
 
+fn section_heading(title: &'static str, number: &'static str) -> Div {
+    div()
+        .h(px(26.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_between()
+        .border_b_1()
+        .border_color(rgb(0x303e4e))
+        .text_size(px(13.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(title)
+        .child(
+            div()
+                .text_size(px(10.))
+                .text_color(rgb(0x91a2b4))
+                .child(number),
+        )
+}
 fn label(text: &str) -> Div {
     div()
         .text_size(px(11.))
-        .text_color(rgb(0x83909e))
+        .text_color(rgb(0x91a2b4))
         .mb(px(4.))
         .child(text.to_owned())
 }
 fn metric(key: &str, value: String) -> Div {
     div()
         .flex_1()
+        .min_w_0()
+        .bg(rgb(0x18212c))
         .border_1()
-        .border_color(rgb(0x2d3745))
+        .border_color(rgb(0x303e4e))
         .p(px(10.))
         .child(label(key))
         .child(
             div()
-                .text_size(px(17.))
-                .text_color(rgb(0xe9eef5))
+                .font_family(if cfg!(windows) { "Consolas" } else { "Menlo" })
+                .text_size(px(16.))
+                .text_color(rgb(0xdce6ee))
                 .child(value),
         )
 }
@@ -467,11 +489,13 @@ fn button(id: &'static str, text: &str, primary: bool) -> Stateful<Div> {
         .items_center()
         .justify_center()
         .border_1()
-        .border_color(rgb(if primary { 0x22d3b0 } else { 0x3c4858 }))
-        .bg(rgb(if primary { 0x22d3b0 } else { 0x1a222d }))
-        .text_color(rgb(if primary { 0x071414 } else { 0xd9e1eb }))
+        .border_color(rgb(if primary { 0x52849e } else { 0x303e4e }))
+        .bg(rgb(if primary { 0x243e50 } else { 0x202c39 }))
+        .text_color(rgb(if primary { 0xc0eaff } else { 0xdce6ee }))
         .text_size(px(12.))
         .cursor_pointer()
+        .hover(|s| s.bg(rgb(0x304458)).border_color(rgb(0x5b829d)))
+        .active(|s| s.bg(rgb(0x172633)))
         .child(text.to_owned())
 }
 impl Render for Desktop {
@@ -484,7 +508,7 @@ impl Render for Desktop {
         drop(live);
         let phase = status.as_ref().map(|s| s.phase);
         let (text, color) = match phase {
-            Some(Phase::Connected) => ("已连接", 0x22d3b0),
+            Some(Phase::Connected) => ("已连接", 0x6bc9f3),
             Some(Phase::Connecting) => ("连接中", 0xe8b64c),
             Some(Phase::Stopping) => ("正在断开", 0xe8b64c),
             Some(Phase::Failed) => ("连接失败", 0xf87171),
@@ -496,23 +520,26 @@ impl Render for Desktop {
             .unwrap_or_default();
         div()
             .size_full()
-            .bg(rgb(0x101720))
-            .text_color(rgb(0xd9e1eb))
+            .bg(rgb(0x10161e))
+            .text_color(rgb(0xdce6ee))
             .text_size(px(12.))
             .flex()
             .flex_col()
             .child(
                 div()
-                    .h(px(46.))
+                    .h(px(54.))
+                    .flex_shrink_0()
+                    .bg(rgb(0x18212b))
                     .px(px(16.))
                     .border_b_1()
-                    .border_color(rgb(0x2d3745))
+                    .border_color(rgb(0x303e4e))
                     .flex()
                     .items_center()
                     .justify_between()
                     .child(
                         div()
                             .flex()
+                            .items_center()
                             .gap(px(10.))
                             .child(
                                 div()
@@ -520,25 +547,43 @@ impl Render for Desktop {
                                     .font_weight(FontWeight::BOLD)
                                     .child("EasyConnect"),
                             )
-                            .child(div().text_color(rgb(0x6f8297)).child("/ PRIVATE NETWORK")),
+                            .child(div().text_color(rgb(0x6f8297)).child("隧道控制台")),
                     )
-                    .child(div().text_color(rgb(color)).child(format!("■ {text}"))),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .px(px(10.))
+                            .py(px(5.))
+                            .bg(rgb(0x202c39))
+                            .border_1()
+                            .border_color(rgb(0x303e4e))
+                            .child(div().size(px(6.)).bg(rgb(color)))
+                            .child(div().text_color(rgb(color)).child(text)),
+                    ),
             )
             .child(
                 div()
                     .flex()
                     .flex_1()
                     .min_h_0()
+                    .p(px(12.))
+                    .gap(px(12.))
                     .child(
                         div()
-                            .w(px(300.))
+                            .w(px(292.))
+                            .bg(rgb(0x18212c))
                             .flex_shrink_0()
                             .p(px(14.))
-                            .border_r_1()
-                            .border_color(rgb(0x2d3745))
+                            .border_1()
+                            .border_color(rgb(0x303e4e))
                             .flex()
-                            .flex_col()
-                            .gap(px(12.))
+                            .min_h_0()
+                            .id("connection-panel")
+                            .overflow_y_scroll()
+                            .child(div().flex().flex_col().gap(px(10.))
+                            .child(section_heading("连接设置", "01"))
                             .child(
                                 div()
                                     .child(label("网关 URL"))
@@ -557,7 +602,14 @@ impl Render for Desktop {
                             .child(
                                 div()
                                     .id("remember")
+                                    .h(px(30.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .border_b_1()
+                                    .border_color(rgb(0x273341))
                                     .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(0x202c39)))
                                     .on_click(cx.listener(|view, _, _, cx| {
                                         if view.controller.live.lock().ok().is_some_and(|s| s.busy)
                                         {
@@ -581,10 +633,34 @@ impl Render for Desktop {
                                         }
                                         cx.notify();
                                     }))
-                                    .child(format!(
-                                        "{} 记住密码 · 系统凭据存储",
-                                        if self.remember { "[■]" } else { "[ ]" }
-                                    )),
+                                    .child("记住密码")
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(8.))
+                                            .text_size(px(11.))
+                                            .text_color(rgb(0x91a2b4))
+                                            .child("系统凭据存储")
+                                            .child(
+                                                div()
+                                                    .size(px(12.))
+                                                    .border_1()
+                                                    .border_color(rgb(if self.remember {
+                                                        0x6bc9f3
+                                                    } else {
+                                                        0x546475
+                                                    }))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .when(self.remember, |s| {
+                                                        s.child(
+                                                            div().size(px(6.)).bg(rgb(0x6bc9f3)),
+                                                        )
+                                                    }),
+                                            ),
+                                    ),
                             )
                             .child(
                                 div()
@@ -615,7 +691,7 @@ impl Render for Desktop {
                             .child(
                                 div()
                                     .border_t_1()
-                                    .border_color(rgb(0x2d3745))
+                                    .border_color(rgb(0x303e4e))
                                     .pt(px(12.))
                                     .child(label("权限服务"))
                                     .child(div().mb(px(8.)).child(if installed {
@@ -648,16 +724,16 @@ impl Render for Desktop {
                                     .child(
                                         "TUN / IPv4 / TCP · UDP · ICMP\n资源网段与 DNS 从网关获取",
                                     ),
-                            ),
+                            )) ,
                     )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .p(px(14.))
                             .flex()
                             .flex_col()
                             .gap(px(10.))
+                            .child(section_heading("隧道状态", "02"))
                             .child(
                                 div()
                                     .flex()
@@ -701,7 +777,7 @@ impl Render for Desktop {
                                     .text_color(rgb(if notice.is_some() {
                                         0xe8b64c
                                     } else {
-                                        0x83909e
+                                        0x91a2b4
                                     }))
                                     .child(notice.unwrap_or_else(|| {
                                         "首次安装后台服务后，使用 URL 和账号密码即可连接。".into()
@@ -710,7 +786,8 @@ impl Render for Desktop {
                             .child(
                                 div()
                                     .border_1()
-                                    .border_color(rgb(0x2d3745))
+                                    .border_color(rgb(0x303e4e))
+                                    .bg(rgb(0x121b25))
                                     .flex_1()
                                     .min_h_0()
                                     .flex()
@@ -720,8 +797,12 @@ impl Render for Desktop {
                                             .px(px(10.))
                                             .py(px(6.))
                                             .border_b_1()
-                                            .border_color(rgb(0x2d3745))
-                                            .child("事件日志 / LIVE"),
+                                            .border_color(rgb(0x303e4e))
+                                            .bg(rgb(0x18212c))
+                                            .flex()
+                                            .justify_between()
+                                            .child("事件日志")
+                                            .child(div().text_color(rgb(0x91a2b4)).child("LIVE")),
                                     )
                                     .child(
                                         div()
@@ -745,15 +826,17 @@ impl Render for Desktop {
             )
             .child(
                 div()
-                    .h(px(24.))
+                    .h(px(30.))
+                    .flex_shrink_0()
+                    .bg(rgb(0x151e28))
                     .px(px(12.))
                     .border_t_1()
-                    .border_color(rgb(0x2d3745))
+                    .border_color(rgb(0x303e4e))
                     .flex()
                     .items_center()
                     .justify_between()
                     .text_size(px(10.))
-                    .text_color(rgb(0x83909e))
+                    .text_color(rgb(0x91a2b4))
                     .child(format!(
                         "{}  /  第三方 VPN 客户端",
                         if cfg!(windows) { "WINDOWS" } else { "macOS" }
@@ -774,7 +857,15 @@ pub fn run() -> Result<()> {
         theme.radius_lg = px(0.);
         theme.shadow = false;
         theme.font_size = px(12.);
-        let bounds = Bounds::centered(None, size(px(780.), px(560.)), cx);
+        theme.colors.background = rgb(0x10161e).into();
+        theme.colors.foreground = rgb(0xdce6ee).into();
+        theme.colors.border = rgb(0x303e4e).into();
+        theme.colors.input = rgb(0x405064).into();
+        theme.colors.primary = rgb(0x6bc9f3).into();
+        theme.colors.ring = rgb(0x6bc9f3).into();
+        theme.colors.caret = rgb(0x6bc9f3).into();
+        theme.colors.muted_foreground = rgb(0x91a2b4).into();
+        let bounds = Bounds::centered(None, size(px(820.), px(610.)), cx);
         let result = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
