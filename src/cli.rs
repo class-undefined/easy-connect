@@ -73,8 +73,16 @@ enum Command {
         #[arg(long)]
         owner: String,
     },
-    /// Check macOS utun and ICMP forwarding locally, without a VPN login.
-    TunSelfTest,
+    /// Check local TUN and ICMP forwarding without a VPN login.
+    TunSelfTest {
+        /// Also test a Linux network namespace through source NAT.
+        #[cfg(target_os = "linux")]
+        #[arg(long)]
+        forwarding: bool,
+    },
+    /// Withdraw VPN subnet advertisements left by an interrupted Linux worker.
+    #[cfg(target_os = "linux")]
+    LinuxCleanup,
     /// Generate a profile. No connection or credential storage.
     Init {
         #[arg(long)]
@@ -133,14 +141,6 @@ enum Command {
 
 pub(crate) fn profile(gateway: &str, pin: Option<&str>) -> Result<Value> {
     validate_gateway(gateway)?;
-    let url = Url::parse(gateway)?;
-    let pin = pin.or_else(|| {
-        if url.host_str() == Some("166.111.77.32") && url.port_or_known_default() == Some(4430) {
-            Some("012fa1b92104a5d514b903a7691e791e890452a499c6980cb590f89016464bb3")
-        } else {
-            None
-        }
-    });
     if let Some(pin) = pin {
         parse_sha256_pin(pin)?;
     }
@@ -207,6 +207,15 @@ fn load_profile(path: &PathBuf, require_routes: bool) -> Result<Value> {
         .context("invalid timeout_seconds")?;
     if !(1..=60).contains(&timeout) {
         bail!("timeout_seconds must be within 1..60");
+    }
+    if !config["tunnel"]["share_with_tailscale"].is_null()
+        && !config["tunnel"]["share_with_tailscale"].is_boolean()
+    {
+        bail!("tunnel.share_with_tailscale must be a boolean");
+    }
+    #[cfg(not(target_os = "linux"))]
+    if config["tunnel"]["share_with_tailscale"].as_bool() == Some(true) {
+        bail!("Tailscale sharing currently supports Linux only");
     }
     let mtu = config["tunnel"]["mtu"].as_u64().context("invalid mtu")?;
     if !(576..=1500).contains(&mtu) {
@@ -567,10 +576,19 @@ async fn connect(
         eprintln!("logout did not complete; the gateway may retain the session until timeout");
     }
     if let Some(reason) = reason {
-        bail!(reason.message());
+        return Err(SessionEnded(reason).into());
     }
     service_result
 }
+
+#[derive(Debug)]
+pub struct SessionEnded(pub SessionEndReason);
+impl std::fmt::Display for SessionEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.message())
+    }
+}
+impl std::error::Error for SessionEnded {}
 
 fn connection_cancelled() -> bool {
     crate::service::STOP.load(std::sync::atomic::Ordering::Relaxed)
@@ -687,8 +705,17 @@ pub async fn run() -> Result<()> {
                 tokio::task::spawn_blocking(move || crate::service::run(&owner, stop)).await?
             }
         }
-        Command::TunSelfTest => {
+        #[cfg(target_os = "linux")]
+        Command::LinuxCleanup => tun::linux::cleanup(),
+        Command::TunSelfTest {
+            #[cfg(target_os = "linux")]
+            forwarding,
+        } => {
             tun::preflight()?;
+            #[cfg(target_os = "linux")]
+            if forwarding {
+                return tun::linux::self_test_forwarding().await;
+            }
             tun::self_test().await
         }
         Command::Init {
@@ -1065,19 +1092,18 @@ mod tests {
     }
 
     #[test]
-    fn url_only_uses_defaults_and_binds_known_pin_to_exact_gateway() {
-        let known = profile("https://166.111.77.32:4430/", None).unwrap();
-        assert!(known["tls"]["leaf_sha256"].is_string());
-        assert_eq!(known["proxy"]["auto_resources"], true);
-        for url in ["https://166.111.77.32:443", "https://example.com:4430"] {
-            assert!(profile(url, None).unwrap()["tls"]["leaf_sha256"].is_null());
-        }
-        let override_pin = "00".repeat(32);
+    fn generated_profiles_use_only_explicit_certificate_pins() {
+        let generated = profile("https://vpn.example.com:4430/", None).unwrap();
+        assert!(generated["tls"]["leaf_sha256"].is_null());
+        assert_eq!(generated["proxy"]["auto_resources"], true);
+        let pin = "ab".repeat(32);
         assert_eq!(
-            profile("https://166.111.77.32:4430", Some(&override_pin)).unwrap()["tls"]["leaf_sha256"],
-            override_pin
+            profile("https://vpn.example.com:4430", Some(&pin)).unwrap()["tls"]["leaf_sha256"],
+            pin
         );
+        assert!(profile("https://vpn.example.com", Some("invalid")).is_err());
     }
+
     #[test]
     fn cli_requires_one_gateway_source() {
         assert!(
@@ -1125,7 +1151,7 @@ mod tests {
         ] {
             assert!(validate_gateway(url).is_err());
         }
-        assert!(validate_gateway("https://166.111.77.32:4430/").is_ok());
+        assert!(validate_gateway("https://vpn.example.com:4430/").is_ok());
     }
     #[test]
     fn profile_requires_explicit_routes() {

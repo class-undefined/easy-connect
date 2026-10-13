@@ -138,29 +138,57 @@ fn inactive(status: &Status) -> bool {
 // overwrite the result of a newer connect/disconnect request.
 impl Controller {
     pub(super) fn new() -> Self {
-        let live = Arc::new(Mutex::new(Live::default()));
+        Self::configured(true)
+    }
+    pub(super) fn for_tailscale() -> Self {
+        Self::configured(false)
+    }
+    fn configured(native: bool) -> Self {
+        let live = Arc::new(Mutex::new(if native {
+            Live::default()
+        } else {
+            Live {
+                readiness: Readiness::Ready,
+                status: Some(Status::default()),
+                ..Default::default()
+            }
+        }));
         let (commands, receiver) = mpsc::channel();
         let state = live.clone();
         std::thread::spawn(move || {
-            prepare(&state);
+            if native {
+                prepare(&state);
+            }
             loop {
                 match receiver.recv_timeout(POLL) {
                     Ok(Command::Action { pending, work }) => {
                         let result = work();
-                        let status = service::request(Request::Status).ok();
+                        let status = if native {
+                            service::request(Request::Status).ok()
+                        } else {
+                            Some(Status::default())
+                        };
                         if let Ok(mut live) = state.lock() {
                             live.finish_action(pending, result, status);
                         }
                     }
-                    Ok(Command::Prepare) => prepare(&state),
+                    Ok(Command::Prepare) => {
+                        if native {
+                            prepare(&state);
+                        }
+                    }
                     Ok(Command::Quit(install)) => {
                         let updating = install.is_some();
-                        let result = finish_exit(
-                            &mut service::request,
-                            &mut || std::thread::sleep(RETRY),
-                            install,
-                            service::installed(),
-                        );
+                        let result = if native {
+                            finish_exit(
+                                &mut service::request,
+                                &mut || std::thread::sleep(RETRY),
+                                install,
+                                service::installed(),
+                            )
+                        } else {
+                            install.map_or(Ok(()), |work| work())
+                        };
                         if let Ok(mut live) = state.lock() {
                             live.quit_ready = result.is_ok();
                             live.quitting = result.is_ok();
@@ -179,6 +207,7 @@ impl Controller {
                             break;
                         }
                     }
+                    Err(RecvTimeoutError::Timeout) if !native => {}
                     Err(RecvTimeoutError::Timeout) => {
                         let status = service::request(Request::Status);
                         if let Ok(mut live) = state.lock() {
@@ -384,6 +413,26 @@ fn ensure_service(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn client_mode_runs_actions_and_exits_without_preparing_native_service() {
+        let controller = Controller::for_tailscale();
+        assert_eq!(controller.live.lock().unwrap().readiness, Readiness::Ready);
+        let (sent, received) = std::sync::mpsc::channel();
+        assert!(controller.action(move || {
+            sent.send(()).unwrap();
+            Ok(())
+        }));
+        received.recv_timeout(Duration::from_secs(1)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while controller.live.lock().unwrap().busy && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        controller.quit();
+        while !controller.live.lock().unwrap().quit_ready && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(controller.live.lock().unwrap().quit_ready);
+    }
     #[test]
     fn update_installer_waits_for_disconnect_and_aborts_on_cleanup_failure() {
         use std::sync::atomic::{AtomicBool, Ordering};

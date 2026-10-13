@@ -82,6 +82,12 @@ impl Render for PasswordView {
 }
 impl Desktop {
     pub(super) fn open_password(&mut self, cx: &mut Context<Self>) {
+        if self.tailscale_client {
+            if let Ok(mut live) = self.controller.live.lock() {
+                live.notice = Some("切换到 VPN 模式后才能修改 VPN 账号密码".into());
+            }
+            return;
+        }
         self.startup_pending = false;
         if let Some(handle) = self.password_window
             && handle

@@ -1,6 +1,8 @@
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod dns;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "linux")]
+pub mod linux;
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub mod routes;
 #[cfg(target_os = "windows")]
 mod windows_dns;
@@ -18,7 +20,7 @@ use serde_json::Value;
 use std::{net::Ipv4Addr, sync::Arc};
 
 pub fn preflight() -> Result<()> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         // SAFETY: geteuid has no pointer arguments.
         if unsafe { libc::geteuid() } != 0 {
@@ -34,11 +36,11 @@ pub fn preflight() -> Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    bail!("TUN supports macOS and Windows")
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    bail!("TUN supports macOS, Windows and Linux")
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn echo_reply(request: &[u8]) -> Result<Vec<u8>> {
     use ec_compat::engine::ip_packet::validate_ipv4_packet;
     validate_ipv4_packet(request, None)?;
@@ -59,7 +61,7 @@ fn echo_reply(request: &[u8]) -> Result<Vec<u8>> {
     Ok(reply)
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn internet_checksum(bytes: &[u8]) -> u16 {
     let mut sum = 0_u32;
     for chunk in bytes.chunks(2) {
@@ -71,7 +73,7 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub async fn self_test() -> Result<()> {
     use anyhow::Context;
     use std::collections::BTreeSet;
@@ -124,12 +126,12 @@ pub async fn self_test() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 pub async fn self_test() -> Result<()> {
-    bail!("utun self-test supports macOS only")
+    bail!("TUN self-test supports macOS, Windows and Linux")
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub async fn run(
     plane: EasyConnectDataPlane,
     published: PublishedResources,
@@ -153,13 +155,24 @@ pub async fn run(
         excluded.insert(gateway);
     }
     let (domains, cidrs) = published.effective_routes(&config)?;
+    #[cfg(target_os = "linux")]
+    let dns_servers = {
+        let _ = dns_servers;
+        Vec::new()
+    };
     let planned = routes::plan_routes(&cidrs, &dns_servers, &excluded)?;
-    if planned.is_empty() && domains.is_empty() {
+    #[cfg(target_os = "linux")]
+    if config["tunnel"]["share_with_tailscale"].as_bool() == Some(true) {
+        linux::validate_routes(&planned)?;
+    }
+    if planned.is_empty() && (cfg!(target_os = "linux") || domains.is_empty()) {
         bail!("gateway supplied no usable TUN destinations");
     }
     let device = Arc::new(create_device(address, mtu)?);
     let interface = device.name()?;
     let count = planned.len();
+    #[cfg(target_os = "linux")]
+    let shared_routes = planned.clone();
     let interface_for_routes = interface.clone();
     let routes = tokio::task::spawn_blocking(move || {
         routes::RouteManager::install(
@@ -171,6 +184,7 @@ pub async fn run(
     })
     .await??;
     let routes: routes::SharedRoutes = Arc::new(Mutex::new(Box::new(routes)));
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let dns_proxy = dns::DnsProxy::bind(
         address,
         dns_servers,
@@ -179,6 +193,7 @@ pub async fn run(
         routes.clone(),
     )
     .await?;
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let dns_registration = if domains.is_empty() {
         None
     } else {
@@ -200,6 +215,18 @@ pub async fn run(
     if restored > 0 {
         eprintln!("Restored {restored} TUN routes before marking the connection ready");
     }
+    #[cfg(target_os = "linux")]
+    let sharing = {
+        let _ = policy;
+        if config["tunnel"]["share_with_tailscale"]
+            .as_bool()
+            .unwrap_or(false)
+        {
+            Some(linux::Sharing::install(&shared_routes, &interface)?)
+        } else {
+            None
+        }
+    };
     let (_lease, mut sender, mut receiver) = plane.split();
     let (upload, mut outgoing) = tokio::sync::mpsc::channel::<Zeroizing<Vec<u8>>>(256);
     let (download, mut incoming) = tokio::sync::mpsc::channel::<Zeroizing<Vec<u8>>>(256);
@@ -239,14 +266,22 @@ pub async fn run(
         &mut incoming,
         &mut failure,
     );
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let dns_service = dns_proxy.serve();
+    #[cfg(target_os = "linux")]
+    let dns_service = std::future::pending::<Result<()>>();
     let outcome = tokio::select! {
         result=pump=>result,
-        result=dns_proxy.serve()=>result,
+        result=dns_service=>result,
         result=crate::shutdown_signal()=>result,
         result=monitor_routes(&routes)=>result,
     };
     // Unblock network reads and bounded channels before waiting for workers.
+    #[cfg(target_os = "linux")]
+    drop(sharing);
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     drop(dns_registration);
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     drop(dns_proxy);
     drop(sockets);
     drop(upload);
@@ -267,7 +302,7 @@ pub async fn run(
     outcome
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 async fn monitor_routes(routes: &routes::SharedRoutes) -> Result<()> {
     let mut timer = tokio::time::interval(std::time::Duration::from_secs(3));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -289,7 +324,7 @@ async fn monitor_routes(routes: &routes::SharedRoutes) -> Result<()> {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 trait PacketDevice: Send + Sync {
     fn recv(
         &self,
@@ -301,7 +336,7 @@ trait PacketDevice: Send + Sync {
     ) -> impl std::future::Future<Output = std::io::Result<usize>> + Send;
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 impl PacketDevice for tun_rs::AsyncDevice {
     async fn recv(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
         self.recv(buffer).await
@@ -311,7 +346,7 @@ impl PacketDevice for tun_rs::AsyncDevice {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 async fn relay(
     device: &impl PacketDevice,
     address: Ipv4Addr,
@@ -345,7 +380,10 @@ async fn relay(
     }
 }
 
-#[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+#[cfg(all(
+    test,
+    any(target_os = "macos", target_os = "windows", target_os = "linux")
+))]
 mod tests {
     use super::*;
     use std::{collections::BTreeSet, sync::Mutex};
@@ -460,7 +498,7 @@ mod tests {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 pub async fn run(
     _: EasyConnectDataPlane,
     _: PublishedResources,
@@ -469,10 +507,10 @@ pub async fn run(
     _: Vec<Ipv4Addr>,
     _: usize,
 ) -> Result<()> {
-    bail!("TUN supports macOS only")
+    bail!("TUN supports macOS, Windows and Linux")
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn create_device(address: Ipv4Addr, mtu: usize) -> Result<tun_rs::AsyncDevice> {
     let builder = tun_rs::DeviceBuilder::new()
         .mtu(mtu as u16)
@@ -482,6 +520,8 @@ fn create_device(address: Ipv4Addr, mtu: usize) -> Result<tun_rs::AsyncDevice> {
         b.associate_route(false);
         b.packet_information(false);
     });
+    #[cfg(target_os = "linux")]
+    let builder = builder.name("ectun0").packet_information(false);
     #[cfg(target_os = "windows")]
     let builder = {
         let dll = std::env::current_exe()?.with_file_name("wintun.dll");
@@ -497,11 +537,15 @@ fn create_device(address: Ipv4Addr, mtu: usize) -> Result<tun_rs::AsyncDevice> {
     Ok(builder.build_async()?)
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn ping_once(target: Ipv4Addr) -> std::io::Result<std::process::Output> {
     #[cfg(target_os = "macos")]
     let result = std::process::Command::new("/sbin/ping")
         .args(["-n", "-c", "1", "-t", "5", &target.to_string()])
+        .output();
+    #[cfg(target_os = "linux")]
+    let result = std::process::Command::new("ping")
+        .args(["-n", "-c", "1", "-W", "2", &target.to_string()])
         .output();
     #[cfg(target_os = "windows")]
     let result = std::process::Command::new("ping.exe")

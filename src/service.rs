@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 #[cfg(target_os = "windows")]
 use std::net::{TcpListener, TcpStream};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::os::unix::net::{UnixListener as TcpListener, UnixStream as TcpStream};
 use std::{
     collections::VecDeque,
@@ -193,7 +193,7 @@ struct Response {
 }
 
 pub fn current_owner() -> Result<String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         // SAFETY: geteuid takes no pointers.
         Ok(unsafe { libc::geteuid() }.to_string())
@@ -214,11 +214,11 @@ pub fn current_owner() -> Result<String> {
         validate_owner(&owner)?;
         Ok(owner)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     bail!("unsupported platform")
 }
 fn validate_owner(owner: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if owner.parse::<u32>().unwrap_or(0) == 0 || !owner.bytes().all(|b| b.is_ascii_digit()) {
         bail!("owner must be a regular user UID");
     }
@@ -236,10 +236,12 @@ pub fn token_path(owner: &str) -> Result<PathBuf> {
     validate_owner(owner)?;
     #[cfg(target_os = "macos")]
     let base = PathBuf::from("/Library/Application Support/EasyConnect");
+    #[cfg(target_os = "linux")]
+    let base = PathBuf::from("/run/easy-connect");
     #[cfg(target_os = "windows")]
     let base = known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramData)?
         .join("EasyConnect Rust");
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     let base = PathBuf::from("/unsupported");
     Ok(base.join(format!("rpc-{owner}.token")))
 }
@@ -256,7 +258,7 @@ fn token(owner: &str) -> Result<Zeroizing<String>> {
 pub fn installed() -> bool {
     current_owner().and_then(|o| token(&o)).is_ok()
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn socket_path(owner: &str) -> Result<PathBuf> {
     validate_owner(owner)?;
     Ok(PathBuf::from(format!("/var/run/easy-connect-{owner}.sock")))
@@ -273,6 +275,31 @@ fn connect_broker(owner: &str) -> Result<TcpStream> {
         return Err(std::io::Error::last_os_error().into());
     }
     if uid != 0 {
+        bail!("broker endpoint is not root-owned");
+    }
+    Ok(socket)
+}
+#[cfg(target_os = "linux")]
+fn connect_broker(owner: &str) -> Result<TcpStream> {
+    use std::os::fd::AsRawFd;
+    let socket =
+        TcpStream::connect(socket_path(owner)?).context("background service is not running")?;
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: live fd and correctly sized writable SO_PEERCRED output buffer.
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if credentials.uid != 0 {
         bail!("broker endpoint is not root-owned");
     }
     Ok(socket)
@@ -312,9 +339,9 @@ fn connect_broker(_: &str) -> Result<TcpStream> {
     }
     Ok(socket)
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct SocketGuard(PathBuf);
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
@@ -645,7 +672,7 @@ pub fn run(owner: &str, stop: Arc<AtomicBool>) -> Result<()> {
     let capability = token(owner)?;
     #[cfg(target_os = "windows")]
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, PORT))?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     let (listener, _socket_guard) = {
         use std::{
             ffi::CString,
@@ -687,7 +714,7 @@ pub fn run(owner: &str, stop: Arc<AtomicBool>) -> Result<()> {
                 if !peer.ip().is_loopback() {
                     continue;
                 }
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 let _ = peer;
                 let Ok((client, server, request)) =
                     authenticate_request(&mut socket, capability.as_bytes())
@@ -727,6 +754,7 @@ pub fn run(owner: &str, stop: Arc<AtomicBool>) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(not(target_os = "linux"))]
 pub fn install(owner: &str) -> Result<()> {
     validate_owner(owner)?;
     crate::tun::preflight()?;
@@ -771,6 +799,10 @@ pub fn install(owner: &str) -> Result<()> {
     install_windows(owner, &file)?;
     println!("Background service installed; subsequent connections need no elevation");
     Ok(())
+}
+#[cfg(target_os = "linux")]
+pub fn install(_: &str) -> Result<()> {
+    bail!("Linux runs the VPN directly under systemd; use scripts/install-linux.sh")
 }
 #[cfg(target_os = "macos")]
 fn install_macos(owner: &str, token: &std::path::Path) -> Result<()> {

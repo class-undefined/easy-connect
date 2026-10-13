@@ -1,0 +1,33 @@
+[Unit]
+Description=EasyConnect IPv4 VPN and Tailscale subnet sharing
+Wants=network-online.target tailscaled.service
+After=network-online.target tailscaled.service
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=root
+RuntimeDirectory=easy-connect
+RuntimeDirectoryMode=0700
+UMask=0077
+StandardInput=file:/etc/easy-connect/credentials
+ExecStartPre=/usr/local/bin/easy-connect linux-cleanup
+ExecStart=/usr/local/bin/easy-connect connect --config /etc/easy-connect/profile.json --mode tun --credentials-stdin
+ExecStopPost=/usr/local/bin/easy-connect linux-cleanup
+Restart=on-failure
+RestartSec=20
+# Explicit remote logout/kick requires operator action, not another login.
+RestartPreventExitStatus=77
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run/easy-connect
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

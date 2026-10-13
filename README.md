@@ -2,7 +2,7 @@
 
 [![Build and release](https://github.com/class-undefined/easy-connect/actions/workflows/build.yml/badge.svg)](https://github.com/class-undefined/easy-connect/actions/workflows/build.yml)
 
-独立的 EasyConnect 兼容 Rust 客户端，提供 **GPUI 桌面窗口、系统托盘、TUN 和命令行**，支持 macOS 与 Windows。运行时不依赖官方 APP、后台、Docker 或虚拟机。
+独立的 EasyConnect 兼容 Rust 客户端，提供 **GPUI 桌面窗口、系统托盘、TUN 和命令行**，支持 macOS 与 Windows 桌面，以及 Linux CLI/TUN。运行时不依赖官方 APP、后台、Docker 或虚拟机。
 
 界面采用紧凑间距、直角控件、状态摘要和事件日志，支持 URL 和账号密码。记住密码使用 **macOS 钥匙串 / Windows 凭据管理器**，配置 JSON 不存密码。关闭窗口隐藏至托盘并保持连接；托盘支持显示窗口、断开和退出。
 
@@ -16,6 +16,7 @@
 |---|---|---|
 | macOS | Apple Silicon / Intel | DMG，内含 EasyConnect Rust.app |
 | Windows | x86_64 / aarch64 | ZIP，内含桌面、CLI 与对应架构的 wintun.dll |
+| Linux | x86_64 / aarch64 | TAR.GZ，内含 CLI、systemd 服务和安装脚本 |
 
 macOS 将应用拖入 Applications；Windows 解压后运行 `easy-connect-gui.exe`，保持 CLI 和 `wintun.dll` 在同一目录。
 
@@ -27,15 +28,17 @@ macOS 将应用拖入 Applications；Windows 解压后运行 `easy-connect-gui.e
 
 连接成功后，主窗口隐藏登录表单，按服务器分组显示资源名称、地址和端口，并提供 **断开连接** 按钮。资源目录来自当前登录会话；目录或字段过长时，会提示已简化显示。断开后恢复登录表单。
 
-底部显示连接状态和连接环境就绪提示。**高级设置**保留修改密码和保存设置；**日志**和**关于**从菜单打开。macOS 提供原生应用、连接、编辑和窗口菜单。macOS / Windows 托盘也可打开主窗口、日志、关于及检查更新。
+底部显示连接状态、应用版本和连接环境就绪提示。**高级设置**提供 Tailscale 客户端模式、证书指纹、修改密码和保存设置；**日志**和**关于**从菜单打开。macOS 提供原生应用、连接、编辑和窗口菜单。macOS / Windows 托盘也可打开主窗口、日志、关于及检查更新。
 
-客户端定期检查当前会话。网关明确报告顶号时，显示“账号已在其他设备登录，本次连接已断开”。管理员断开、会话超时和网络中断分别提示原因，并恢复登录表单。会话结束后等待手动连接，避免自动登录造成反复顶号。
+高级设置中的 **Tailscale 客户端模式**用于访问已部署的子网出口。可填写出口主机名或 Tailscale IP，也可留空自动检测。开启后，应用接收已批准的 IPv4 子网路由，停用本机 VPN 自动登录，并将连接按钮改为检查 Tailscale 状态。客户端模式不安装或查询本机 VPN 后台，也不读取 VPN 密码。关闭时恢复开启前的子网路由接收设置。证书 SHA-256 指纹也可在高级设置中填写，新用户的网关默认留空。
+
+客户端通过协议心跳维护连接，通道故障时检查当前会话并尝试恢复。网关明确报告顶号时，显示“账号已在其他设备登录，本次连接已断开”。管理员断开、会话超时和网络中断分别提示原因，并恢复登录表单。会话结束后等待手动连接，避免自动登录造成反复顶号。
 
 默认在启动时、之后每 12 小时检测本仓库最新正式 GitHub Release，可关闭自动检测或手动检查。发现新版后，点击 **一键更新**，应用会下载当前系统和架构的安装包，显示进度并校验 SHA-256。macOS 还会检查应用签名、标识和版本。
 
 安装前会断开 VPN 并等待清理完成，再退出应用、替换文件并启动新版。系统需要管理员权限时会弹出授权框。下载或校验失败时保留当前应用；文件替换失败时尝试恢复旧版，并提供重试和手动下载入口。Windows 更新只替换安装包管理的文件，保留安装目录中的其他文件。
 
-一键更新从 0.4.7 起提供。旧版用户需要先手动安装一次 0.4.7 或更新版本。关于页显示开发者“野漫横江 / class-undefined”。发布包同时包含 CLI 和 GUI。
+一键更新从 0.4.7 起提供。旧版用户需要先手动安装一次 0.4.7 或更新版本。关于页显示开发者“野漫横江 / class-undefined”。macOS / Windows 发布包同时包含 CLI 和 GUI。
 
 **后续连接无需重复输入 sudo / UAC 密码**。应用自动检查后台版本；新版启动时先断开旧连接并等待清理完成，再更新并启动匹配版本的后台服务。安装或更新时仍需系统管理员授权，无需手动管理后台服务。准备失败时显示原因和重试入口，不会反复弹出授权框。桌面以普通用户运行；后台不保存 VPN 密码到磁盘。
 
@@ -48,11 +51,11 @@ macOS 发布包使用 `class-undefined` 自签名代码签名证书（非 Apple 
 通常只需 URL，不需要配置文件：
 
 ```sh
-easy-connect connect --gateway https://166.111.77.32:4430/
-easy-connect resources --gateway https://166.111.77.32:4430/
+easy-connect connect --gateway https://vpn.example.com/
+easy-connect resources --gateway https://vpn.example.com/
 ```
 
-账号密码在本机隐藏输入。安装后台后，普通用户 TUN 连接委托给服务。未安装服务时，macOS 使用 sudo，Windows 在管理员终端连接。
+账号密码在本机隐藏输入。安装后台后，普通用户 TUN 连接委托给服务。未安装服务时，macOS / Linux 使用 sudo，Windows 在管理员终端连接。Linux 使用 systemd 直接运行 CLI，部署见 [Linux 与 Tailscale 子网共享](docs/linux-tailscale.md)。
 
 macOS 命令行一次性安装：
 
@@ -83,9 +86,9 @@ ping INTERNAL_GATEWAY_IP
 curl https://INTRANET_HOST/
 ```
 
-macOS 使用 utun，Windows 使用 Wintun。外层服务器和物理下一跳被排除，避免递归隧道。安装及登记 DNS 后核验路由，运行中每 3 秒恢复丢失的自有路由，不覆盖其他出口。退出清理路由、DNS 和网卡。
+macOS 使用 utun，Windows 使用 Wintun，Linux 使用 `/dev/net/tun`。外层服务器和物理下一跳被排除，避免递归隧道。安装及登记 DNS 后核验路由，运行中每 3 秒恢复丢失的自有路由，不覆盖其他出口。退出清理路由、DNS 和网卡。
 
-内网域名使用静态 DNS 表或网关 DNS。macOS 使用临时 SystemConfiguration，Windows 使用带进程标记的 NRPT，工作进程结束后后台清理。DNS 的 IPv4 结果按需添加主机路由。不支持 IPv6，内网 AAAA 查询返回空结果。
+macOS / Windows 的内网域名使用静态 DNS 表或网关 DNS。Linux 当前只处理 IP 资源，不设置 DNS。macOS 使用临时 SystemConfiguration，Windows 使用带进程标记的 NRPT，工作进程结束后后台清理。DNS 的 IPv4 结果按需添加主机路由。不支持 IPv6，内网 AAAA 查询返回空结果。
 
 管理员终端可运行无需 VPN 账号的网卡自测：
 
@@ -107,7 +110,7 @@ cargo clippy --locked --features desktop --bins -- -D warnings
 
 GPUI 0.2.2 使用运行时 Metal 着色器编译，避免独立 Metal 编译工具依赖。仅构建 CLI 可省略 `--features desktop`。
 
-Actions 在 main/PR 上验证并打包四个架构；推送 `v*` 标签，全部构建成功后自动发布 Release、DMG/ZIP 和 SHA-256 清单。Windows 固定下载 Wintun 0.14.1 并验证 SHA-256。产物包含项目、上游和依赖许可证。
+Linux 构建使用 `cargo build --locked --release --bin easy-connect`。Actions 在 main/PR 上验证并打包六种平台与架构组合；推送 `v*` 标签，全部构建成功后自动发布 Release、DMG/ZIP/TAR.GZ 和 SHA-256 清单。Windows 固定下载 Wintun 0.14.1 并验证 SHA-256。产物包含项目、上游和依赖许可证。
 
 ## 验证范围
 
@@ -116,7 +119,8 @@ Actions 在 main/PR 上验证并打包四个架构；推送 `v*` 标签，全部
 - macOS 桌面已启动并完成 GPUI/托盘初始化，密码存储与服务安装需用户本机操作。
 - 0.4.6 的取消、资源展示和会话结束逻辑参考已安装的官方 EasyConnect 7.6.7 Web SDK。已用模拟响应验证状态转换；首次升级和真实顶号仍需在测试环境验收。
 - Windows 双架构由原生 GitHub runner 编译；真实 VPN 连通和服务安装仍需 Windows 机器验收。
-- 不支持验证码/SSO、旧版四通道自动降级、IPv6 或持续自动重连。
+- Linux x86_64 已在 Ubuntu 24.04 验证 TUN、SNAT、systemd 与 Tailscale 子网共享，并从 macOS 验证实际 TCP/UDP 连通。Linux ARM64 已加入 CI，实体机器验证待完成。
+- 不支持验证码/SSO、旧版四通道自动降级或 IPv6。
 - 示例证书指纹由网络观测取得，仅绑定对应 IP 和端口，尚未管理员独立核对；证书变化会拒绝连接。
 
 授权、端口及 ICMP 是否允许仍由网关和目标决定。不会自动停止官方连接，对照测试前请自行断开官方连接。
@@ -126,7 +130,7 @@ Actions 在 main/PR 上验证并打包四个架构；推送 `v*` 标签，全部
 兼容网关的临近过期提醒、密码过期和首次强制改密。强制改密时暂停建隧道，在 GUI 点击 **修改密码**；也可从高级设置主动修改。修改成功后同步保存的密码，再重新连接。GUI 修改前需先断开现有连接。
 
 ```sh
-easy-connect change-password --gateway https://166.111.77.32:4430/
+easy-connect change-password --gateway https://vpn.example.com/
 ```
 
 命令会分别询问当前密码、新密码和确认密码，不接收明文密码参数。协议依据及验证范围见 [密码策略兼容](docs/password-policy.md)。

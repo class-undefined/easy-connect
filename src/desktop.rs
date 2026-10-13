@@ -29,6 +29,7 @@ use zeroize::Zeroizing;
 mod controller;
 mod password;
 mod resources;
+mod tailscale;
 mod updates;
 use controller::{Controller, Live, Readiness};
 use updates::UpdateState;
@@ -71,6 +72,12 @@ struct Preferences {
     auto_login: bool,
     #[serde(default = "enabled")]
     auto_update: bool,
+    #[serde(default)]
+    tailscale_client: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    tailscale_router: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tailscale_routes_before: Option<bool>,
 }
 fn enabled() -> bool {
     true
@@ -78,12 +85,15 @@ fn enabled() -> bool {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            gateway: "https://166.111.77.32:4430/".into(),
+            gateway: String::new(),
             username: String::new(),
             remember: true,
             cert_sha256: String::new(),
             auto_login: true,
             auto_update: true,
+            tailscale_client: false,
+            tailscale_router: String::new(),
+            tailscale_routes_before: None,
         }
     }
 }
@@ -231,16 +241,28 @@ fn install_service() -> Result<()> {
     Ok(())
 }
 
+enum TailOutcome {
+    Mode {
+        enabled: bool,
+        before: Option<bool>,
+        summary: Option<tailscale::Summary>,
+    },
+    Checked(tailscale::Summary),
+}
 struct Desktop {
     gateway: Entity<InputState>,
     username: Entity<InputState>,
     password: Entity<InputState>,
-    // Keep existing trust pins when migrating preferences, without exposing an editor.
-    cert_sha256: String,
+    cert_sha256: Entity<InputState>,
     remember: bool,
     auto_login: bool,
     auto_update: bool,
     advanced: bool,
+    tailscale_client: bool,
+    tailscale_router: Entity<InputState>,
+    tailscale_routes_before: Option<bool>,
+    tailscale_summary: Option<tailscale::Summary>,
+    tailscale_outcome: Arc<Mutex<Option<TailOutcome>>>,
     startup_pending: bool,
     updates: Arc<Mutex<UpdateState>>,
     last_update: Instant,
@@ -306,12 +328,25 @@ impl Desktop {
             s.set_value(preferences.username.clone(), window, cx)
         });
         if preferences.remember
+            && !preferences.tailscale_client
             && let Ok(entry) = vault(&preferences)
             && let Ok(secret) = entry.get_password()
         {
             let secret = Zeroizing::new(secret);
             password.update(cx, |s, cx| s.set_value(secret.to_string(), window, cx));
         }
+        let cert_sha256 = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("SHA-256 指纹，留空使用系统证书校验")
+        });
+        cert_sha256.update(cx, |s, cx| {
+            s.set_value(preferences.cert_sha256.clone(), window, cx)
+        });
+        let tailscale_router = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("出口主机名或 Tailscale IP，留空自动检测")
+        });
+        tailscale_router.update(cx, |s, cx| {
+            s.set_value(preferences.tailscale_router.clone(), window, cx)
+        });
         let commands = Arc::new(Mutex::new(Vec::new()));
         install_menus(commands.clone(), cx);
         let initial_update = updates::initial_state();
@@ -356,12 +391,21 @@ impl Desktop {
             gateway,
             username,
             password,
-            cert_sha256: preferences.cert_sha256,
+            cert_sha256,
             remember: preferences.remember,
-            auto_login: preferences.auto_login && preferences.remember,
+            auto_login: preferences.auto_login
+                && preferences.remember
+                && !preferences.tailscale_client,
             auto_update: preferences.auto_update,
             advanced: false,
-            startup_pending: preferences.auto_login && preferences.remember,
+            tailscale_client: preferences.tailscale_client,
+            tailscale_router,
+            tailscale_routes_before: preferences.tailscale_routes_before,
+            tailscale_summary: None,
+            tailscale_outcome: Arc::new(Mutex::new(None)),
+            startup_pending: preferences.auto_login
+                && preferences.remember
+                && !preferences.tailscale_client,
             updates,
             last_update: Instant::now(),
             commands,
@@ -371,7 +415,11 @@ impl Desktop {
             logs_item,
             about_item,
             updates_item,
-            controller: Controller::new(),
+            controller: if preferences.tailscale_client {
+                Controller::for_tailscale()
+            } else {
+                Controller::new()
+            },
             tray,
             show,
             disconnect,
@@ -400,9 +448,46 @@ impl Desktop {
                 }
             }
         }));
+        if view.tailscale_client {
+            view.check_tailscale(cx);
+        }
         Ok(view)
     }
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let outcome = self
+            .tailscale_outcome
+            .lock()
+            .ok()
+            .and_then(|mut value| value.take());
+        match outcome {
+            Some(TailOutcome::Mode {
+                enabled,
+                before,
+                summary,
+            }) => {
+                self.tailscale_client = enabled;
+                self.tailscale_routes_before = before;
+                self.tailscale_summary = summary;
+                self.startup_pending = false;
+                if enabled {
+                    self.auto_login = false;
+                    self.controller = Controller::for_tailscale();
+                } else {
+                    self.controller = Controller::new();
+                    if self.remember
+                        && let Ok(entry) = vault(&self.preferences(cx))
+                        && let Ok(password) = entry.get_password()
+                    {
+                        let password = Zeroizing::new(password);
+                        self.password
+                            .update(cx, |s, cx| s.set_value(password.to_string(), window, cx));
+                    }
+                }
+            }
+            Some(TailOutcome::Checked(summary)) => self.tailscale_summary = Some(summary),
+            None => {}
+        }
+
         let changed = self
             .controller
             .live
@@ -507,13 +592,20 @@ impl Desktop {
         tray_icon(false).expect("static tray icon dimensions are valid")
     }
     fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tailscale_client {
+            self.check_tailscale(cx);
+            return;
+        }
         let preferences = Preferences {
             gateway: self.gateway.read(cx).value().to_string(),
             username: self.username.read(cx).value().to_string(),
             remember: self.remember,
             auto_login: self.auto_login,
             auto_update: self.auto_update,
-            cert_sha256: self.cert_sha256.clone(),
+            tailscale_client: self.tailscale_client,
+            tailscale_router: self.tailscale_router.read(cx).value().trim().to_owned(),
+            tailscale_routes_before: self.tailscale_routes_before,
+            cert_sha256: self.cert_sha256.read(cx).value().trim().to_owned(),
         };
         let password = Zeroizing::new(self.password.read(cx).value().to_string());
         let accepted = self.controller.connect(move || {
@@ -649,21 +741,92 @@ fn install_menus(queue: Arc<Mutex<Vec<MenuCommand>>>, cx: &mut gpui::App) {
 }
 
 impl Desktop {
+    fn check_tailscale(&mut self, cx: &mut Context<Self>) {
+        let router = self.tailscale_router.read(cx).value().trim().to_owned();
+        let outcome = self.tailscale_outcome.clone();
+        self.controller.action(move || {
+            let summary = tailscale::check(&router)?;
+            *outcome
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Tailscale 状态锁异常"))? =
+                Some(TailOutcome::Checked(summary));
+            Ok(())
+        });
+    }
+    fn switch_tailscale(&mut self, cx: &mut Context<Self>) {
+        let eligible = self.controller.live.lock().is_ok_and(|live| {
+            !live.busy
+                && !live.quitting
+                && !matches!(
+                    live.phase(),
+                    Some(Phase::Connecting | Phase::Connected | Phase::Stopping)
+                )
+        });
+        if !eligible {
+            if let Ok(mut live) = self.controller.live.lock() {
+                live.notice = Some("请先断开本机 VPN 或等待当前操作完成，再切换模式".into());
+            }
+            return;
+        }
+        let enabled = !self.tailscale_client;
+        let mut preferences = self.preferences(cx);
+        let password = Zeroizing::new(self.password.read(cx).value().to_string());
+        let outcome = self.tailscale_outcome.clone();
+        self.controller.action(move || {
+            let (summary, before) = if enabled {
+                let (summary, before) = tailscale::activate(&preferences.tailscale_router)?;
+                (Some(summary), Some(before))
+            } else {
+                if let Some(before) = preferences.tailscale_routes_before {
+                    tailscale::restore(before)?;
+                }
+                (None, None)
+            };
+            preferences.tailscale_client = enabled;
+            preferences.tailscale_routes_before = before;
+            if enabled {
+                preferences.auto_login = false;
+            }
+            if let Err(error) = save(&preferences, &password) {
+                if enabled && let Some(before) = before {
+                    let _ = tailscale::restore(before);
+                } else if !enabled {
+                    let _ = tailscale::check(&preferences.tailscale_router);
+                }
+                return Err(error);
+            }
+            *outcome
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Tailscale 状态锁异常"))? = Some(TailOutcome::Mode {
+                enabled,
+                before,
+                summary,
+            });
+            Ok(())
+        });
+    }
     fn preferences(&self, cx: &Context<Self>) -> Preferences {
         Preferences {
             gateway: self.gateway.read(cx).value().to_string(),
             username: self.username.read(cx).value().to_string(),
             remember: self.remember,
-            cert_sha256: self.cert_sha256.clone(),
+            cert_sha256: self.cert_sha256.read(cx).value().trim().to_owned(),
             auto_login: self.auto_login,
             auto_update: self.auto_update,
+            tailscale_client: self.tailscale_client,
+            tailscale_router: self.tailscale_router.read(cx).value().trim().to_owned(),
+            tailscale_routes_before: self.tailscale_routes_before,
         }
     }
     fn persist(&self, cx: &Context<Self>) {
         let preferences = self.preferences(cx);
         let password = Zeroizing::new(self.password.read(cx).value().to_string());
-        self.controller
-            .action(move || save(&preferences, &password));
+        self.controller.action(move || {
+            if preferences.tailscale_client {
+                tailscale::check(&preferences.tailscale_router)?;
+            }
+            save(&preferences, &password)
+        });
     }
     fn menu_command(&mut self, command: MenuCommand, window: &mut Window, cx: &mut Context<Self>) {
         match command {
@@ -805,10 +968,13 @@ impl Render for Desktop {
         let phase = live.as_ref().and_then(|s| s.phase());
         let can_connect = live.as_ref().is_some_and(|s| s.can_connect());
         let can_disconnect = live.as_ref().is_some_and(|s| s.can_disconnect());
-        let connect_label = live
-            .as_ref()
-            .map(|s| s.connect_label())
-            .unwrap_or("正在准备…");
+        let connect_label = if self.tailscale_client {
+            "检查 Tailscale 连接"
+        } else {
+            live.as_ref()
+                .map(|s| s.connect_label())
+                .unwrap_or("正在准备…")
+        };
         // gpui-component disables click handlers on loading buttons. Keep the
         // connecting action clickable so the same button can cancel it.
         let loading =
@@ -820,7 +986,9 @@ impl Render for Desktop {
             .filter(|_| !matches!(phase, Some(Phase::Connecting | Phase::Stopping)))
             .and_then(|s| s.session_end.as_ref());
         let show_resources = status.as_ref().is_some_and(resources::visible);
-        let (state, color) = if session_end.is_some() {
+        let (state, color) = if self.tailscale_client {
+            ("Tailscale 子网模式", 0x8bb8e8)
+        } else if session_end.is_some() {
             ("连接已结束", 0xe1ad68)
         } else {
             phase_style(phase)
@@ -937,6 +1105,7 @@ impl Render for Desktop {
                                 .flex()
                                 .flex_col()
                                 .gap(px(12.))
+                                .when(!self.tailscale_client,|s|{s
                                 .child(field("网关 URL", &self.gateway))
                                 .child(field("账号", &self.username))
                                 .child(field("密码", &self.password))
@@ -987,6 +1156,7 @@ impl Render for Desktop {
                                                 })),
                                         ),
                                 )
+                                })
                                 .child(
                                     div().flex().gap(px(8.)).child(
                                         Button::new("connect")
@@ -1013,6 +1183,10 @@ impl Render for Desktop {
                                             })),
                                     ),
                                 )
+                                .when(self.tailscale_client,|s| {
+                                    s.child(div().text_color(rgb(0x91a2b4)).child("使用已部署的 Tailscale 子网出口；请先安装并登录 Tailscale。"))
+                                      .when_some(self.tailscale_summary.clone(),|s,summary|s.child(format!("最近检查：{} 个在线出口，{} 条已批准 IPv4 路由",summary.routers,summary.routes)))
+                                })
                                 .when_some(policy, |s, policy| {
                                     s.child(
                                         div()
@@ -1081,6 +1255,11 @@ impl Render for Desktop {
                                             .border_t_1()
                                             .border_color(rgb(0x303e4e))
                                             .pt(px(12.))
+                                            .child(toggle("tailscale-client","Tailscale 客户端模式",self.tailscale_client)
+                                                .on_click(cx.listener(|view,_,_,cx|view.switch_tailscale(cx))))
+                                            .child(field("Tailscale 子网出口（可选）",&self.tailscale_router))
+                                            .child(div().text_color(rgb(0x91a2b4)).child("开启后接收已批准的 IPv4 子网路由，并停用本机 VPN 自动登录。关闭时恢复原来的路由接收设置。"))
+                                            .when(!self.tailscale_client,|s|s.child(field("证书 SHA-256",&self.cert_sha256)))
                                             .child(
                                                 button(
                                                     "manual-change-password",
@@ -1306,7 +1485,7 @@ mod tests {
         assert!(serde_json::from_str::<Preferences>(r#"{"gateway":"https://example.com","username":"u","remember":true,"cert_sha256":"","password":"secret"}"#).is_err());
     }
     #[test]
-    fn preferences_roundtrip_without_certificate_editor_preserves_existing_trust() {
+    fn preferences_roundtrip_preserves_existing_certificate_trust() {
         let fresh = serde_json::to_string(&Preferences::default()).unwrap();
         assert!(!fresh.contains("cert_sha256"));
         assert!(serde_json::from_str::<Preferences>(&fresh).is_ok());
@@ -1329,5 +1508,17 @@ mod tests {
         assert!(defaults.remember);
         assert!(defaults.auto_login);
         assert!(defaults.auto_update);
+    }
+    #[test]
+    fn legacy_settings_do_not_enable_tailscale_or_restore_unowned_route_preferences() {
+        let legacy: Preferences = serde_json::from_str(
+            r#"{"gateway":"https://vpn.example.com","username":"user","remember":true}"#,
+        )
+        .unwrap();
+        assert!(!legacy.tailscale_client);
+        assert!(legacy.tailscale_routes_before.is_none());
+        assert!(legacy.tailscale_router.is_empty());
+        let defaults = Preferences::default();
+        assert!(defaults.gateway.is_empty());
     }
 }

@@ -1,9 +1,9 @@
 {
-  "base_url": "https://166.111.77.32:4430",
+  "base_url": "https://vpn.example.com",
   "timeout_seconds": 15,
   "user_agent": "EasyConnect_mac",
   "tls": {
-    "leaf_sha256": "012fa1b92104a5d514b903a7691e791e890452a499c6980cb590f89016464bb3"
+    "leaf_sha256": null
   },
   "endpoints": {
     "discovery": "/por/login_auth.csp?apiversion=1",
@@ -19,5 +19,7 @@
     "route_ipv4_cidrs": [],
     "vpn_dns_servers": []
   },
-  "tunnel": { "mtu": 1400 }
+  "tunnel": {
+    "mtu": 1400
+  }
 }

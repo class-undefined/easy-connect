@@ -1,11 +1,17 @@
 """Collect crate-shipped license texts for binary redistribution."""
+import argparse
 import json
 import pathlib
 import subprocess
 
 root = pathlib.Path(__file__).resolve().parent.parent
-metadata = json.loads(subprocess.check_output(
-    ["cargo", "metadata", "--locked", "--features", "desktop", "--format-version", "1"], cwd=root))
+parser = argparse.ArgumentParser()
+parser.add_argument("--cli-only", action="store_true")
+args = parser.parse_args()
+command = ["cargo", "metadata", "--locked", "--format-version", "1"]
+if not args.cli_only:
+    command += ["--features", "desktop"]
+metadata = json.loads(subprocess.check_output(command, cwd=root))
 destination = root / ".release-stage" / "DEPENDENCY-LICENSES.txt"
 destination.parent.mkdir(exist_ok=True)
 with destination.open("w", encoding="utf-8") as output:

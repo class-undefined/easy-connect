@@ -51,6 +51,10 @@ impl Cidr {
     pub fn text(self) -> String {
         format!("{}/{}", Ipv4Addr::from(self.network), self.prefix)
     }
+    #[cfg(any(target_os = "linux", test))]
+    pub fn overlaps(self, other: Self) -> bool {
+        self.contains(Ipv4Addr::from(other.network)) || other.contains(Ipv4Addr::from(self.network))
+    }
 }
 
 pub fn plan_routes(
@@ -101,7 +105,7 @@ pub trait RouteCommands: Send + Sync {
     }
 }
 
-/// macOS netstat abbreviates networks (e.g. `166.111/16`, `10/8`).
+/// macOS netstat abbreviates networks (e.g. `198.18/16`, `10/8`).
 #[cfg(any(target_os = "macos", test))]
 fn table_cidr(value: &str) -> Result<Cidr> {
     let (address, explicit_prefix) = value
@@ -151,6 +155,39 @@ fn parse_route_table(text: &str) -> Result<BTreeSet<(Cidr, String)>> {
 
 pub struct SystemRoutes;
 impl RouteCommands for SystemRoutes {
+    #[cfg(target_os = "linux")]
+    fn change(&self, add: bool, cidr: Cidr, interface: &str) -> Result<()> {
+        let output = Command::new("ip")
+            .args([
+                "-4",
+                "route",
+                if add { "add" } else { "del" },
+                &cidr.text(),
+                "dev",
+                interface,
+            ])
+            .output()
+            .context("cannot execute iproute2")?;
+        if !output.status.success() {
+            bail!(
+                "Linux route operation failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    fn snapshot(&self) -> Result<Option<BTreeSet<(Cidr, String)>>> {
+        let output = Command::new("ip")
+            .args(["-4", "-j", "route", "show", "table", "main"])
+            .output()?;
+        if !output.status.success() {
+            bail!("cannot inspect Linux route table");
+        }
+        Ok(Some(parse_linux_route_table(&String::from_utf8(
+            output.stdout,
+        )?)?))
+    }
     #[cfg(target_os = "macos")]
     fn change(&self, add: bool, cidr: Cidr, interface: &str) -> Result<()> {
         let output = Command::new("/sbin/route")
@@ -274,6 +311,7 @@ impl<R: RouteCommands> RouteManager<R> {
     pub fn permits(&self, ip: Ipv4Addr) -> bool {
         !self.excluded.contains(&ip) && self.installed.iter().any(|c| c.contains(ip))
     }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn ensure_hosts(&mut self, addresses: &[Ipv4Addr]) -> Result<()> {
         for ip in addresses {
             if self.excluded.contains(ip)
@@ -358,6 +396,21 @@ impl<R: RouteCommands> Drop for RouteManager<R> {
 }
 
 pub fn physical_gateway(peer: Ipv4Addr) -> Result<Option<Ipv4Addr>> {
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("ip")
+            .args(["-4", "-j", "route", "get", &peer.to_string()])
+            .output()?;
+        if !output.status.success() {
+            bail!("cannot inspect Linux VPN outer route");
+        }
+        let rows: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        Ok(rows
+            .as_array()
+            .context("invalid Linux route lookup")?
+            .iter()
+            .find_map(|row| row["gateway"].as_str().and_then(|value| value.parse().ok())))
+    }
     #[cfg(target_os = "macos")]
     {
         let output = Command::new("/sbin/route")
@@ -388,8 +441,33 @@ pub fn physical_gateway(peer: Ipv4Addr) -> Result<Option<Ipv4Addr>> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_route_table(text: &str) -> Result<BTreeSet<(Cidr, String)>> {
+    let rows: serde_json::Value = serde_json::from_str(text)?;
+    let mut routes = BTreeSet::new();
+    for row in rows.as_array().context("invalid Linux route table")? {
+        let (Some(destination), Some(interface)) = (row["dst"].as_str(), row["dev"].as_str())
+        else {
+            continue;
+        };
+        if destination == "default" {
+            continue;
+        }
+        let destination = if destination.contains('/') {
+            destination.to_owned()
+        } else {
+            format!("{destination}/32")
+        };
+        if let Ok(cidr) = Cidr::parse(&destination) {
+            routes.insert((cidr, interface.to_owned()));
+        }
+    }
+    Ok(routes)
+}
+
 pub trait RoutingTable: Send {
     fn permits(&self, ip: Ipv4Addr) -> bool;
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn ensure_hosts(&mut self, addresses: &[Ipv4Addr]) -> Result<()>;
     fn clear(&mut self);
     fn audit_and_repair(&mut self) -> Result<usize> {
@@ -401,6 +479,7 @@ impl<R: RouteCommands> RoutingTable for RouteManager<R> {
     fn permits(&self, ip: Ipv4Addr) -> bool {
         self.permits(ip)
     }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn ensure_hosts(&mut self, addresses: &[Ipv4Addr]) -> Result<()> {
         self.ensure_hosts(addresses)
     }
@@ -419,11 +498,24 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     #[test]
+    fn parses_linux_routes_and_preserves_interface_ownership() {
+        let table = r#"[{"dst":"default","gateway":"192.0.2.1","dev":"eth0"},{"dst":"10.8.0.0/16","dev":"ectun0"},{"dst":"192.0.2.7","dev":"eth0"}]"#;
+        let routes = parse_linux_route_table(table).unwrap();
+        assert!(routes.contains(&(Cidr::parse("10.8.0.0/16").unwrap(), "ectun0".into())));
+        assert!(routes.contains(&(Cidr::host("192.0.2.7".parse().unwrap()), "eth0".into())));
+        assert_eq!(routes.len(), 2);
+        assert!(
+            Cidr::parse("100.64.0.0/10")
+                .unwrap()
+                .overlaps(Cidr::parse("100.64.0.7/32").unwrap())
+        );
+    }
+    #[test]
     fn parses_macos_abbreviated_network_and_host_routes() {
-        let table = "Routing tables\nInternet:\nDestination Gateway Flags Netif Expire\ndefault 1.2.3.4 UGSc en0\n166.111/16 utun10 USc utun10\n192.168.10.2 utun10 UHS utun10\n10/8 link#2 UCS en0\n";
+        let table = "Routing tables\nInternet:\nDestination Gateway Flags Netif Expire\ndefault 1.2.3.4 UGSc en0\n198.18/16 utun10 USc utun10\n198.51.100.2 utun10 UHS utun10\n10/8 link#2 UCS en0\n";
         let parsed = parse_route_table(table).unwrap();
-        assert!(parsed.contains(&(Cidr::parse("166.111.0.0/16").unwrap(), "utun10".into())));
-        assert!(parsed.contains(&(Cidr::host("192.168.10.2".parse().unwrap()), "utun10".into())));
+        assert!(parsed.contains(&(Cidr::parse("198.18.0.0/16").unwrap(), "utun10".into())));
+        assert!(parsed.contains(&(Cidr::host("198.51.100.2".parse().unwrap()), "utun10".into())));
         assert!(parsed.contains(&(Cidr::parse("10.0.0.0/8").unwrap(), "en0".into())));
         assert!(parse_route_table("unexpected output").is_err());
     }
@@ -451,7 +543,7 @@ mod tests {
     }
     #[test]
     fn restores_externally_removed_subnet_and_preserves_replaced_routes() {
-        let cidr = Cidr::parse("192.168.10.0/24").unwrap();
+        let cidr = Cidr::parse("198.51.100.0/24").unwrap();
         let table = Arc::new(Mutex::new(BTreeSet::new()));
         let events = Arc::new(Mutex::new(Vec::new()));
         let kernel = Kernel {
@@ -473,26 +565,26 @@ mod tests {
     }
     #[test]
     fn excludes_outer_server_without_losing_its_neighbors() {
-        let peer = "166.111.77.32".parse().unwrap();
+        let peer = "198.18.77.32".parse().unwrap();
         let routes = plan_routes(
-            &BTreeSet::from(["166.111.0.0/16".into()]),
+            &BTreeSet::from(["198.18.0.0/16".into()]),
             &[],
             &BTreeSet::from([peer]),
         )
         .unwrap();
         assert!(!routes.iter().any(|c| c.contains(peer)));
         for neighbor in [
-            "166.111.77.31",
-            "166.111.77.33",
-            "166.111.0.0",
-            "166.111.255.255",
+            "198.18.77.31",
+            "198.18.77.33",
+            "198.18.0.0",
+            "198.18.255.255",
         ] {
             assert!(routes.iter().any(|c| c.contains(neighbor.parse().unwrap())));
         }
         assert!(
             !routes
                 .iter()
-                .any(|c| c.contains("166.112.0.1".parse().unwrap()))
+                .any(|c| c.contains("198.19.0.1".parse().unwrap()))
         );
     }
     #[test]

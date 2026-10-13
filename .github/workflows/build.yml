@@ -112,9 +112,58 @@ jobs:
           name: easy-connect-${{ matrix.os }}-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      LZMA_API_STATIC: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.1'
+          targets: ${{ matrix.target }}
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-cli
+      - name: Install Linux networking test tools
+        run: sudo apt-get update && sudo apt-get install -y iproute2 iptables iputils-ping
+      - name: Validate Linux CLI and transport
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --bin easy-connect --target ${{ matrix.target }} -- -D warnings
+          cargo test --locked --lib --target ${{ matrix.target }}
+          cargo test --locked -p ec-compat --lib --target ${{ matrix.target }}
+          cargo build --locked --bin easy-connect --target ${{ matrix.target }}
+      - name: Test real Linux TUN and SNAT forwarding
+        run: |
+          sudo target/${{ matrix.target }}/debug/easy-connect tun-self-test
+          sudo target/${{ matrix.target }}/debug/easy-connect tun-self-test --forwarding
+      - name: Package Linux CLI
+        run: |
+          cargo build --locked --release --bin easy-connect --target ${{ matrix.target }}
+          python scripts/collect-licenses.py --cli-only
+          bash scripts/package-linux.sh '${{ matrix.arch }}' "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: easy-connect-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, build-linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
