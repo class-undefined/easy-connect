@@ -39,7 +39,8 @@ jobs:
             arch: aarch64
             os: windows
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    # Intel cold builds plus Rust cache compression/upload can exceed 45 minutes.
+    timeout-minutes: ${{ matrix.runner == 'macos-15-intel' && 75 || 45 }}
     env:
       CARGO_TERM_COLOR: always
       LZMA_API_STATIC: '1'
