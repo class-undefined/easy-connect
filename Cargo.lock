@@ -1823,9 +1823,10 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "easy-connect"
-version = "0.4.12"
+version = "0.4.15"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "core-foundation 0.9.4",
  "dirs 6.0.0",

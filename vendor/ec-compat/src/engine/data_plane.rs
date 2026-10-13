@@ -1,8 +1,10 @@
 use crate::engine::ip_packet::{push_and_extract_ipv4, validate_ipv4_packet};
+use crate::modern::ModernSessionId;
 use crate::modern::{
     ModernCommand, ModernControlRequest, ModernToken, ModernTokenAcquisition, parse_address_reply,
     validate_channel_reply,
 };
+use crate::session_renewal::{self, MaintenanceStatus};
 use crate::special_tls11::SpecialTls11Stream;
 use crate::{Error, Result};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream};
@@ -95,6 +97,7 @@ struct Shared {
     peer: SocketAddr,
     dial: Arc<Dial>,
     retry_delays: Vec<Duration>,
+    renewal: Mutex<Option<MaintenanceStatus>>,
 }
 impl Shared {
     fn running(&self) -> bool {
@@ -129,6 +132,14 @@ impl Shared {
         let sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
         for socket in sockets.iter().flatten() {
             let _ = socket.shutdown(Shutdown::Both);
+        }
+        if let Some(renewal) = self
+            .renewal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            renewal.stop();
         }
     }
     fn fault(&self, kind: Kind) {
@@ -294,6 +305,7 @@ impl EasyConnectDataPlane {
             peer,
             dial,
             retry_delays: RETRY_DELAYS.to_vec(),
+            renewal: Mutex::new(None),
         });
         shared.register(Kind::Control, &control.shutdown_handle()?)?;
         // The lease guard cancels all sockets on partial setup failures, too.
@@ -344,6 +356,33 @@ impl EasyConnectDataPlane {
     }
     pub fn assigned_address(&self) -> Ipv4Addr {
         self.lease.shared.address
+    }
+    pub(crate) fn start_session_renewal(
+        &mut self,
+        session: &ModernSessionId,
+        status: MaintenanceStatus,
+    ) -> Result<()> {
+        let shared = &self.lease.shared;
+        {
+            let mut renewal = shared.renewal.lock().unwrap_or_else(|e| e.into_inner());
+            if renewal.is_some() || !shared.running() {
+                return Err(Error(
+                    "VPN renewal already attached or transport stopped".into(),
+                ));
+            }
+            *renewal = Some(status.clone());
+        }
+        let weak = Arc::downgrade(shared);
+        let worker = session_renewal::start(shared.peer, session, status, move || {
+            if let Some(shared) = weak.upgrade() {
+                // Publish the terminal renewal state before stopping transports;
+                // the final portal query then cannot mask it as merely online.
+                let _ = shared.events.try_send(());
+                shared.shutdown();
+            }
+        })?;
+        self.lease.workers.push(worker);
+        Ok(())
     }
     pub fn peer_address(&self) -> std::io::Result<SocketAddr> {
         Ok(self.lease.shared.peer)
@@ -710,6 +749,7 @@ mod tests {
                 peer: "198.51.100.9:4430".parse().unwrap(),
                 dial,
                 retry_delays: delays,
+                renewal: Mutex::new(None),
             }),
             receiver,
         )
@@ -758,6 +798,106 @@ mod tests {
         );
         assert_eq!(checksum(&packet[..20]), 0);
         assert_eq!(checksum(&packet[20..]), 0);
+    }
+
+    fn renewal_plane(peer: SocketAddr) -> (EasyConnectDataPlane, Arc<Shared>) {
+        let (mut state, health_events) =
+            shared(Arc::new(|_, _| panic!("no data recovery expected")), vec![]);
+        Arc::get_mut(&mut state).unwrap().peer = peer;
+        let channel = |kind| Channel {
+            stream: Box::new(script(Default::default())),
+            kind,
+            shared: state.clone(),
+        };
+        let plane = EasyConnectDataPlane {
+            lease: AddressLease {
+                shared: state.clone(),
+                control: None,
+                workers: Vec::new(),
+            },
+            sender: PacketSender {
+                channel: Arc::new(Mutex::new(channel(Kind::Send))),
+                shared: state.clone(),
+            },
+            receiver: PacketReceiver {
+                channel: channel(Kind::Receive),
+                buffered: Zeroizing::new(Vec::new()),
+            },
+            health_events: Some(health_events),
+        };
+        (plane, state)
+    }
+
+    #[test]
+    fn dropping_plane_lease_cancels_and_joins_renewal_during_handshake() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (mut plane, state) = renewal_plane(listener.local_addr().unwrap());
+        let renewal = MaintenanceStatus::default();
+        plane
+            .start_session_renewal(
+                &ModernSessionId::from_bytes(b"0123456789abcdef").unwrap(),
+                renewal.clone(),
+            )
+            .unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut hello = [0; 82];
+        server.read_exact(&mut hello).unwrap();
+        let start = Instant::now();
+        drop(plane);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(server.read(&mut [0]).unwrap(), 0);
+        assert!(!state.running());
+        assert_eq!(renewal.termination(), None);
+    }
+
+    #[test]
+    fn terminal_renewal_notifies_monitor_and_closes_all_data_channels() {
+        use crate::session_renewal::Termination;
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (mut plane, state) = renewal_plane(listener.local_addr().unwrap());
+        let mut peers = Vec::new();
+        for kind in [Kind::Control, Kind::Send, Kind::Receive] {
+            let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (peer, _) = listener.accept().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            state.register(kind, &socket).unwrap();
+            peers.push(peer);
+        }
+        let renewal = MaintenanceStatus::default();
+        plane
+            .start_session_renewal(
+                &ModernSessionId::from_bytes(b"0123456789abcdef").unwrap(),
+                renewal.clone(),
+            )
+            .unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        server.read_exact(&mut [0; 82]).unwrap();
+        let mut flight = [0; 122];
+        flight[..9].copy_from_slice(&[22, 3, 1, 0, 74, 2, 0, 0, 70]);
+        flight[79..85].copy_from_slice(&[20, 3, 1, 0, 1, 1]);
+        flight[85..90].copy_from_slice(&[22, 3, 1, 0, 32]);
+        server.write_all(&flight).unwrap();
+        server.read_exact(&mut [0; 43 + 28]).unwrap();
+        let mut reply = [0; 60];
+        reply[..4].copy_from_slice(b"ACKQ");
+        reply[4..8].copy_from_slice(&3_u32.to_be_bytes());
+        server.write_all(&reply).unwrap();
+        // EOF also bounds the wait: a stuck callback fails rather than hanging.
+        for peer in &mut peers {
+            assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+        }
+        plane.lease.workers.pop().unwrap().join().unwrap();
+        assert!(!plane.lease.transport_is_open());
+        assert_eq!(renewal.termination(), Some(Termination::ServerTimeout));
+        assert_eq!(plane.take_health_events().try_recv(), Ok(()));
     }
 
     #[test]

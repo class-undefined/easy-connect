@@ -1,4 +1,4 @@
-use crate::modern::{build_special_client_hello, connect_gateway_tcp, verify_special_certificates};
+use crate::modern::{build_channel_client_hello, connect_gateway_tcp, verify_special_certificates};
 use crate::{Error, Result};
 use hmac::{Hmac, Mac};
 use md5::Md5;
@@ -348,11 +348,51 @@ impl SpecialTls11Stream {
         configured_special_leaf_sha256: Option<&[u8; 32]>,
         observe: impl FnOnce(&TcpStream) -> Result<()>,
     ) -> Result<Self> {
+        Self::connect_channel(
+            address,
+            host,
+            timeout,
+            verified_https_leaf_sha256,
+            configured_special_leaf_sha256,
+            b"L3IP",
+            observe,
+        )
+    }
+
+    /// Experimental independent TCP-proxy TLS transport. This does not establish
+    /// a session renewal contract; callers must validate the application reply.
+    pub fn connect_tcp_proxy(
+        address: SocketAddr,
+        host: &str,
+        timeout: Duration,
+        verified_https_leaf_sha256: &[u8; 32],
+        configured_special_leaf_sha256: Option<&[u8; 32]>,
+    ) -> Result<Self> {
+        Self::connect_channel(
+            address,
+            host,
+            timeout,
+            verified_https_leaf_sha256,
+            configured_special_leaf_sha256,
+            b"TCPP",
+            |_| Ok(()),
+        )
+    }
+
+    fn connect_channel(
+        address: SocketAddr,
+        host: &str,
+        timeout: Duration,
+        verified_https_leaf_sha256: &[u8; 32],
+        configured_special_leaf_sha256: Option<&[u8; 32]>,
+        channel: &[u8; 4],
+        observe: impl FnOnce(&TcpStream) -> Result<()>,
+    ) -> Result<Self> {
         let mut stream = connect_gateway_tcp(address, timeout)?;
         observe(&stream)?;
         let mut client_random = [0_u8; 32];
         OsRng.fill_bytes(&mut client_random);
-        let client_hello = build_special_client_hello(client_random)?;
+        let client_hello = build_channel_client_hello(client_random, channel)?;
         stream.write_all(&client_hello)?;
         let mut transcript = Zeroizing::new(client_hello[5..].to_vec());
         let server_flight = parse_server_flight(&mut stream)?;

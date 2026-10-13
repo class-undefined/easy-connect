@@ -54,7 +54,7 @@ impl ModernSessionId {
         ))
     }
 
-    fn as_bytes(&self) -> &[u8; MODERN_SESSION_ID_LEN] {
+    pub(crate) fn as_bytes(&self) -> &[u8; MODERN_SESSION_ID_LEN] {
         &self.0
     }
 }
@@ -206,9 +206,12 @@ pub fn parse_address_reply(reply: &[u8]) -> Result<Ipv4Addr> {
         return Err(Error("modern address reply is shorter than 8 bytes".into()));
     }
     if reply[0] != ModernCommand::RequestAddress as u8 {
-        return Err(Error(
-            "modern address reply has an unexpected status".into(),
-        ));
+        return Err(Error(format!(
+            "modern address reply has an unexpected status: expected {}, actual {}, reply length {}",
+            ModernCommand::RequestAddress as u8,
+            reply[0],
+            reply.len()
+        )));
     }
     Ok(Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7]))
 }
@@ -227,9 +230,11 @@ pub fn validate_channel_reply(reply: &[u8], command: ModernCommand) -> Result<()
         return Err(Error("modern channel reply is empty".into()));
     }
     if reply[0] != expected {
-        return Err(Error(
-            "modern channel reply has an unexpected status".into(),
-        ));
+        return Err(Error(format!(
+            "modern channel reply has an unexpected status: expected {expected}, actual {}, reply length {}",
+            reply[0],
+            reply.len()
+        )));
     }
     Ok(())
 }
@@ -354,11 +359,18 @@ fn push_u24(output: &mut Vec<u8>, value: usize) -> Result<()> {
 }
 
 pub fn build_special_client_hello(random: [u8; 32]) -> Result<Zeroizing<Vec<u8>>> {
+    build_channel_client_hello(random, b"L3IP")
+}
+
+pub(crate) fn build_channel_client_hello(
+    random: [u8; 32],
+    channel: &[u8; 4],
+) -> Result<Zeroizing<Vec<u8>>> {
     let mut body = Zeroizing::new(Vec::with_capacity(96));
     body.extend_from_slice(&TLS11_VERSION.to_be_bytes());
     body.extend_from_slice(&random);
     body.push(32);
-    body.extend_from_slice(b"L3IP");
+    body.extend_from_slice(channel);
     body.extend_from_slice(&[0; 28]);
     body.extend_from_slice(&4_u16.to_be_bytes());
     body.extend_from_slice(&TLS_RSA_WITH_RC4_128_SHA.to_be_bytes());
@@ -817,6 +829,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tcp_proxy_hello_changes_only_the_channel_marker() {
+        let l3 = build_special_client_hello([7; 32]).unwrap();
+        let tcp = build_channel_client_hello([7; 32], b"TCPP").unwrap();
+        // TLS record (5), handshake header (4), version (2), random (32),
+        // then the 32-byte session-id length and four-byte channel marker.
+        assert_eq!(l3[43], 32);
+        assert_eq!(&l3[44..48], b"L3IP");
+        assert_eq!(&tcp[44..48], b"TCPP");
+        assert_eq!(&l3[..44], &tcp[..44]);
+        assert_eq!(&l3[48..], &tcp[48..]);
+    }
+
+    #[test]
     fn modern_token_requires_an_http_response_prefix() {
         assert!(validate_modern_http_prefix(b"HTTP/1.1").is_ok());
         assert!(validate_modern_http_prefix(b"NOT-HTTP").is_err());
@@ -887,6 +912,25 @@ mod tests {
         assert!(validate_channel_reply(&[2], ModernCommand::Send).is_ok());
         assert!(validate_channel_reply(&[1], ModernCommand::Receive).is_ok());
         assert!(validate_channel_reply(&[1], ModernCommand::Send).is_err());
+    }
+
+    #[test]
+    fn unexpected_status_reports_only_status_and_length() {
+        let reply = b"\x03private-token";
+        assert_eq!(
+            parse_address_reply(reply).unwrap_err().to_string(),
+            "modern address reply has an unexpected status: expected 0, actual 3, reply length 14"
+        );
+        for (command, expected) in [(ModernCommand::Send, 2), (ModernCommand::Receive, 1)] {
+            assert_eq!(
+                validate_channel_reply(reply, command)
+                    .unwrap_err()
+                    .to_string(),
+                format!(
+                    "modern channel reply has an unexpected status: expected {expected}, actual 3, reply length 14"
+                )
+            );
+        }
     }
 
     #[test]

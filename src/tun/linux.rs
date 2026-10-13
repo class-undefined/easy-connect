@@ -289,13 +289,15 @@ pub async fn self_test_forwarding() -> Result<()> {
     struct Cleanup {
         namespace: String,
         host: String,
-        nat: Vec<String>,
+        firewall: Vec<Vec<String>>,
         forward: String,
     }
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            let args: Vec<_> = self.nat.iter().map(String::as_str).collect();
-            let _ = System.run("iptables", &args);
+            for rule in self.firewall.iter().rev() {
+                let args: Vec<_> = rule.iter().map(String::as_str).collect();
+                let _ = System.run("iptables", &args);
+            }
             let _ = System.run("ip", &["netns", "del", &self.namespace]);
             let _ = System.run("ip", &["link", "del", &self.host]);
             let _ = System.run(
@@ -325,10 +327,10 @@ pub async fn self_test_forwarding() -> Result<()> {
     .into_iter()
     .map(str::to_owned)
     .collect();
-    let _cleanup = Cleanup {
+    let mut cleanup = Cleanup {
         namespace: namespace.clone(),
         host: host.clone(),
-        nat: nat.clone(),
+        firewall: Vec::new(),
         forward: String::from_utf8(System.run("sysctl", &["-n", "net.ipv4.ip_forward"])?)?
             .trim()
             .into(),
@@ -368,12 +370,72 @@ pub async fn self_test_forwarding() -> Result<()> {
         ],
     )?;
     System.run("sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
-    let mut add = nat;
-    add[2] = "-A".into();
-    System.run(
-        "iptables",
-        &add.iter().map(String::as_str).collect::<Vec<_>>(),
-    )?;
+    // Docker-enabled CI runners may have a DROP policy or earlier rejecting
+    // rules in FORWARD. Allow only this test's ICMP flow and reverse-NAT reply;
+    // never change the host's firewall policy or flush unrelated rules.
+    let outgoing = [
+        "-D",
+        "FORWARD",
+        "-i",
+        &host,
+        "-o",
+        &interface,
+        "-s",
+        "10.254.254.2/32",
+        "-d",
+        "192.0.2.1/32",
+        "-p",
+        "icmp",
+        "-m",
+        "comment",
+        "--comment",
+        &namespace,
+        "-j",
+        "ACCEPT",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    let incoming = [
+        "-D",
+        "FORWARD",
+        "-i",
+        &interface,
+        "-o",
+        &host,
+        "-s",
+        "192.0.2.1/32",
+        "-d",
+        "10.254.254.2/32",
+        "-p",
+        "icmp",
+        "-m",
+        "conntrack",
+        "--ctstate",
+        "ESTABLISHED,RELATED",
+        "-m",
+        "comment",
+        "--comment",
+        &namespace,
+        "-j",
+        "ACCEPT",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    for rule in [nat, outgoing, incoming] {
+        let mut add = rule.clone();
+        if add[0] == "-t" {
+            add[2] = "-A".into();
+        } else {
+            add[0] = "-I".into();
+        }
+        System.run(
+            "iptables",
+            &add.iter().map(String::as_str).collect::<Vec<_>>(),
+        )?;
+        cleanup.firewall.push(rule);
+    }
     let mut ping = tokio::process::Command::new("ip")
         .args([
             "netns",

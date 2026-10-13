@@ -594,6 +594,47 @@ fn connection_cancelled() -> bool {
     crate::service::STOP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Errors are strings, and XML parser details may contain gateway response
+/// content. Log only reviewed fixed messages and bounded numeric HTTP statuses.
+fn session_status_error_summary(error: &ec_compat::Error) -> &str {
+    let message = error.0.as_str();
+    match message {
+        "gateway session status request failed (timeout)"
+        | "gateway session status request failed (connect_or_tls)"
+        | "gateway session status request failed (protocol_or_io)"
+        | "gateway session status request failed (response_body)"
+        | "gateway session status request failed (transport)"
+        | "gateway session status response read failed"
+        | "gateway session status response exceeds the size limit"
+        | "gateway session status attempted a non-HTTPS response"
+        | "gateway session status has an unexpected root"
+        | "gateway session status has no error code"
+        | "gateway returned an unsupported session status"
+        | "gateway requested an unsupported session switch"
+        | "session status: DTD/entity declarations are not accepted"
+        | "cookie state unavailable"
+        | "网关证书已变化，连接已停止；请联系管理员核实" => message,
+        _ if message.starts_with("session status: invalid XML:") => {
+            "session status: invalid XML (details redacted)"
+        }
+        _ if message.starts_with("session status: invalid UTF-8:") => {
+            "session status: invalid UTF-8 (details redacted)"
+        }
+        _ => {
+            if let Some(status) = message.strip_prefix("gateway session status returned HTTP ")
+                && status.len() == 3
+                && status.bytes().all(|byte| byte.is_ascii_digit())
+                && status
+                    .parse::<u16>()
+                    .is_ok_and(|code| (100..=599).contains(&code))
+            {
+                return message;
+            }
+            "unclassified session status error (details redacted)"
+        }
+    }
+}
+
 /// The state stays on a blocking worker during each HTTPS request. We always
 /// await that worker (including on cancellation) so reqwest is never dropped
 /// on an async runtime thread and no authenticated session is abandoned. Healthy
@@ -647,16 +688,24 @@ where
                 }
                 failures = 0;
             }
-            Err(_) if !final_query => {
+            Err(error) if !final_query => {
                 // The portal and packet transport are independent connections.
                 // An unavailable/unsupported status endpoint does not prove
                 // that the data channel failed. Its owner monitors actual I/O.
                 failures = failures.saturating_add(1_u32);
                 if failures == 1 || failures.is_multiple_of(6) {
                     eprintln!(
-                        "VPN session status query failed ({failures} consecutive transport events); allowing data channel recovery"
+                        "VPN session status query failed ({failures} consecutive transport events): {}; allowing data channel recovery",
+                        session_status_error_summary(&error)
                     );
                 }
+            }
+            Err(error) => {
+                eprintln!(
+                    "VPN final session status query failed: {}",
+                    session_status_error_summary(&error)
+                );
+                return Ok((session, Some(SessionEndReason::ConnectionLost)));
             }
             // A broken data channel with an online/unknown control session is
             // a connectivity failure, never evidence of a private kick.
@@ -864,6 +913,54 @@ async fn connect_brokered(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_status_error_logs_preserve_only_reviewed_diagnostics() {
+        for message in [
+            "gateway session status request failed (timeout)",
+            "gateway session status request failed (connect_or_tls)",
+            "gateway session status returned HTTP 401",
+            "gateway returned an unsupported session status",
+            "gateway requested an unsupported session switch",
+        ] {
+            assert_eq!(
+                session_status_error_summary(&ec_compat::Error(message.into())),
+                message
+            );
+        }
+        for (message, expected) in [
+            (
+                "session status: invalid XML: unknown entity 'private-token'",
+                "session status: invalid XML (details redacted)",
+            ),
+            (
+                "session status: invalid UTF-8: private-token",
+                "session status: invalid UTF-8 (details redacted)",
+            ),
+            (
+                "gateway session status returned HTTP 401 private-token",
+                "unclassified session status error (details redacted)",
+            ),
+            (
+                "gateway session status request failed (timeout) private-token",
+                "unclassified session status error (details redacted)",
+            ),
+            (
+                "request failed: https://vpn.example/?exdata=private-token",
+                "unclassified session status error (details redacted)",
+            ),
+            (
+                "gateway requested an unsupported session switch: private-token",
+                "unclassified session status error (details redacted)",
+            ),
+        ] {
+            assert_eq!(
+                session_status_error_summary(&ec_compat::Error(message.into())),
+                expected
+            );
+        }
+    }
+
     fn queued_health_events(count: usize) -> tokio::sync::mpsc::Receiver<()> {
         let (events, receiver) = tokio::sync::mpsc::channel(count.max(1));
         for _ in 0..count {

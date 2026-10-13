@@ -3,6 +3,8 @@ use crate::config::{GatewayConfiguration, parse_gateway_configuration};
 use crate::engine::data_plane::EasyConnectDataPlane;
 use crate::modern::{ModernSessionId, parse_sha256_pin, request_modern_token_with_pin};
 use crate::probe::{DEFAULT_TIMEOUT_SECONDS, GatewaySession};
+use crate::session_renewal::{MaintenanceStatus, Termination};
+use crate::session_status::SessionEndReason;
 use crate::session_status::{SessionStatus, SessionStatusQuery};
 use crate::xml::{first_descendant_text, parse_xml};
 use crate::{Error, Result};
@@ -27,11 +29,16 @@ pub struct AuthenticatedEngineSession {
     gateway_configuration: GatewayConfiguration,
     configured_certificate_pin: Option<[u8; 32]>,
     status_query: SessionStatusQuery,
+    renewal: MaintenanceStatus,
 }
 
 impl AuthenticatedEngineSession {
     pub fn password_policy(&self) -> Option<&crate::password::PasswordPolicy> {
         self.password_policy.as_ref()
+    }
+    /// Number of positive TIMQ validity replies received by this login's worker.
+    pub fn renewal_confirmations(&self) -> u64 {
+        self.renewal.confirmations()
     }
     pub fn authenticate(config: &Value, username: &str, password: &str) -> Result<Self> {
         let base_url = required_text(config, "base_url")?;
@@ -115,9 +122,13 @@ impl AuthenticatedEngineSession {
             gateway_configuration,
             configured_certificate_pin,
             status_query,
+            renewal: MaintenanceStatus::default(),
         })
     }
 
+    /// Starts the TLS data channels and legacy TIMQ renewal for this login.
+    /// TIMQ uses an independent unencrypted, unauthenticated TCP connection
+    /// carrying the session ID, as required by the macOS 7.6.7 protocol.
     pub fn establish_data_plane(&self) -> Result<EasyConnectDataPlane> {
         let acquisition = request_modern_token_with_pin(
             &self.base_url,
@@ -125,11 +136,37 @@ impl AuthenticatedEngineSession {
             self.timeout,
             self.https_pin,
         )?;
-        EasyConnectDataPlane::connect(
+        let mut plane = EasyConnectDataPlane::connect(
             &self.gateway_host,
             &acquisition,
             self.timeout,
             self.configured_certificate_pin.as_ref(),
+        )?;
+        plane.start_session_renewal(&self.modern_session, self.renewal.clone())?;
+        Ok(plane)
+    }
+
+    /// P0 diagnostic only. Unlike the data plane, this sends the session ID
+    /// in plaintext and cannot authenticate the peer. The HTTPS verification
+    /// below does NOT secure the subsequent independent TCP connection.
+    /// Call only after explicit consent to the legacy protocol's exposure.
+    pub fn probe_legacy_renewal_without_server_authentication(
+        &self,
+        uptime_seconds: u32,
+    ) -> Result<(
+        crate::session_renewal::LegacyProbe,
+        crate::session_renewal::Observation,
+    )> {
+        let acquisition = request_modern_token_with_pin(
+            &self.base_url,
+            &self.modern_session,
+            self.timeout,
+            self.https_pin,
+        )?;
+        crate::session_renewal::LegacyProbe::connect_without_server_authentication(
+            acquisition.peer_address(),
+            &self.modern_session,
+            uptime_seconds,
         )
     }
 
@@ -150,13 +187,24 @@ impl AuthenticatedEngineSession {
 
     /// Reuse the authenticated cookie jar and RSA context; never logs in again.
     pub fn session_status(&self) -> Result<SessionStatus> {
-        self.status_query.query(|stage, path| {
+        if self.renewal.termination() == Some(Termination::SessionChanged) {
+            return Ok(SessionStatus::Ended(SessionEndReason::SessionChanged));
+        }
+        let status = self.status_query.query(|stage, path| {
             self.http
                 .get_once_with_timeout(stage, path, self.timeout.min(Duration::from_secs(3)))
-        })
+        });
+        // Read AFTER HTTP too: renewal may have ended while the portal request
+        // was in flight. A positive or failed portal query cannot resurrect it.
+        resolve_renewal_status(status, self.renewal.termination())
     }
 
     pub fn logout(self) -> Result<()> {
+        self.renewal.stop();
+        if self.renewal.termination() == Some(Termination::SessionChanged) {
+            // Never send the old cookie to a logout endpoint after replacement.
+            return Ok(());
+        }
         self.http
             .get_once_with_timeout(
                 "logout",
@@ -164,6 +212,84 @@ impl AuthenticatedEngineSession {
                 self.timeout.min(Duration::from_secs(3)),
             )
             .map(|_| ())
+    }
+}
+
+fn resolve_renewal_status(
+    status: Result<SessionStatus>,
+    termination: Option<Termination>,
+) -> Result<SessionStatus> {
+    match termination {
+        Some(Termination::SessionChanged) => {
+            Ok(SessionStatus::Ended(SessionEndReason::SessionChanged))
+        }
+        Some(reason) => {
+            if let Ok(SessionStatus::Ended(reason)) = status {
+                return Ok(SessionStatus::Ended(reason));
+            }
+            Ok(SessionStatus::Ended(match reason {
+                Termination::ServerTimeout => SessionEndReason::Timeout,
+                Termination::ValidityExpired
+                | Termination::Unresponsive
+                | Termination::ProtocolError => SessionEndReason::ConnectionLost,
+                Termination::SessionChanged => SessionEndReason::SessionChanged,
+            }))
+        }
+        None => status,
+    }
+}
+
+#[cfg(test)]
+mod renewal_tests {
+    use super::*;
+
+    #[test]
+    fn portal_online_or_failure_cannot_overwrite_terminal_renewal() {
+        for (termination, reason) in [
+            (Termination::ServerTimeout, SessionEndReason::Timeout),
+            (
+                Termination::SessionChanged,
+                SessionEndReason::SessionChanged,
+            ),
+            (
+                Termination::ValidityExpired,
+                SessionEndReason::ConnectionLost,
+            ),
+            (Termination::Unresponsive, SessionEndReason::ConnectionLost),
+            (Termination::ProtocolError, SessionEndReason::ConnectionLost),
+        ] {
+            for status in [
+                Ok(SessionStatus::Online),
+                Err(Error("portal unavailable".into())),
+            ] {
+                assert_eq!(
+                    resolve_renewal_status(status, Some(termination)).unwrap(),
+                    SessionStatus::Ended(reason)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preserve_explicit_remote_logout_and_never_guess_a_private_kick() {
+        assert_eq!(
+            resolve_renewal_status(
+                Ok(SessionStatus::Ended(SessionEndReason::AdminKick)),
+                Some(Termination::ServerTimeout)
+            )
+            .unwrap(),
+            SessionStatus::Ended(SessionEndReason::AdminKick)
+        );
+        assert_eq!(
+            resolve_renewal_status(Ok(SessionStatus::Online), None).unwrap(),
+            SessionStatus::Online
+        );
+        assert!(resolve_renewal_status(Err(Error("portal unavailable".into())), None).is_err());
+        let marker = SessionEndReason::SessionChanged.marker();
+        assert_eq!(
+            SessionEndReason::from_log(&marker),
+            Some(SessionEndReason::SessionChanged)
+        );
     }
 }
 

@@ -26,6 +26,7 @@ pub enum SessionEndReason {
     LocalException,
     Unknown,
     ConnectionLost,
+    SessionChanged,
 }
 
 impl SessionEndReason {
@@ -39,6 +40,7 @@ impl SessionEndReason {
             Self::LocalException => "客户端会话异常，连接已断开，请重新连接。",
             Self::Unknown => "登录会话已结束，请重新连接。",
             Self::ConnectionLost => "与 VPN 服务器的连接已中断，请检查网络后重新连接。",
+            Self::SessionChanged => "服务器已更换登录会话，本次连接已停止，请重新连接。",
         }
     }
 
@@ -150,6 +152,11 @@ fn parse_online(data: &[u8]) -> Result<bool> {
     // ErrorCode is not success. Do not classify malformed/session-switch data.
     code.parse::<i64>()
         .map_err(|_| Error("gateway session status has no error code".into()))?;
+    if value.starts_with("externsession#oldsessid=") {
+        return Err(Error(
+            "gateway requested an unsupported session switch".into(),
+        ));
+    }
     value
         .parse::<i64>()
         .map(|remaining| remaining > 0)
@@ -292,6 +299,21 @@ mod tests {
             assert!(parse_online(xml.as_bytes()).is_err());
         }
         assert!(parse_online(b"<Auth><data>29</data></Auth>").is_err());
+    }
+
+    #[test]
+    fn session_switch_error_does_not_expose_the_session_identifier() {
+        let xml = b"<Auth><ErrorCode>1</ErrorCode><data>externsession#oldsessid=private-session-token</data></Auth>";
+        assert_eq!(
+            parse_online(xml).unwrap_err().to_string(),
+            "gateway requested an unsupported session switch"
+        );
+        assert_eq!(
+            parse_online(b"<Auth><ErrorCode>1</ErrorCode><data>invalid</data></Auth>")
+                .unwrap_err()
+                .to_string(),
+            "gateway returned an unsupported session status"
+        );
     }
 
     #[test]

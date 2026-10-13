@@ -52,11 +52,8 @@ impl Render for PasswordView {
                                 }) {
                                     bail!("请先断开连接，再修改密码");
                                 }
-                                let config = crate::cli::profile(
-                                    &preferences.gateway,
-                                    (!preferences.cert_sha256.is_empty())
-                                        .then_some(preferences.cert_sha256.as_str()),
-                                )?;
+                                let pin = certificates::resolve(&preferences.gateway)?;
+                                let config = crate::cli::profile(&preferences.gateway, Some(&pin))?;
                                 ec_compat::password::change_password(
                                     &config,
                                     &preferences.username,

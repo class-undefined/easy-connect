@@ -10,6 +10,7 @@ use gpui_component::{
     Disableable, Root, Sizable, Theme, ThemeMode,
     button::{Button, ButtonVariants},
     input::{Input, InputState},
+    text::{TextView, TextViewStyle},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -26,6 +27,7 @@ use tray_icon::{
 };
 use zeroize::Zeroizing;
 
+mod certificates;
 mod controller;
 mod password;
 mod resources;
@@ -134,7 +136,19 @@ fn save(preferences: &Preferences, password: &str) -> Result<()> {
     }
     use std::io::Write;
     let mut file = options.open(&temp)?;
-    file.write_all(&serde_json::to_vec_pretty(preferences)?)?;
+    let mut stored = preferences.clone();
+    if stored.cert_sha256.is_empty()
+        && let Ok(bytes) = std::fs::read(&path)
+        && let Ok(previous) = serde_json::from_slice::<Preferences>(&bytes)
+        && let (Ok(current), Ok(old)) = (
+            url::Url::parse(&stored.gateway),
+            url::Url::parse(&previous.gateway),
+        )
+        && current.origin() == old.origin()
+    {
+        stored.cert_sha256 = previous.cert_sha256;
+    }
+    file.write_all(&serde_json::to_vec_pretty(&stored)?)?;
     file.sync_all()?;
     drop(file);
     std::fs::rename(temp, path)?;
@@ -253,7 +267,6 @@ struct Desktop {
     gateway: Entity<InputState>,
     username: Entity<InputState>,
     password: Entity<InputState>,
-    cert_sha256: Entity<InputState>,
     remember: bool,
     auto_login: bool,
     auto_update: bool,
@@ -335,12 +348,6 @@ impl Desktop {
             let secret = Zeroizing::new(secret);
             password.update(cx, |s, cx| s.set_value(secret.to_string(), window, cx));
         }
-        let cert_sha256 = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("SHA-256 指纹，留空使用系统证书校验")
-        });
-        cert_sha256.update(cx, |s, cx| {
-            s.set_value(preferences.cert_sha256.clone(), window, cx)
-        });
         let tailscale_router = cx.new(|cx| {
             InputState::new(window, cx).placeholder("出口主机名或 Tailscale IP，留空自动检测")
         });
@@ -391,7 +398,6 @@ impl Desktop {
             gateway,
             username,
             password,
-            cert_sha256,
             remember: preferences.remember,
             auto_login: preferences.auto_login
                 && preferences.remember
@@ -605,7 +611,7 @@ impl Desktop {
             tailscale_client: self.tailscale_client,
             tailscale_router: self.tailscale_router.read(cx).value().trim().to_owned(),
             tailscale_routes_before: self.tailscale_routes_before,
-            cert_sha256: self.cert_sha256.read(cx).value().trim().to_owned(),
+            cert_sha256: String::new(),
         };
         let password = Zeroizing::new(self.password.read(cx).value().to_string());
         let accepted = self.controller.connect(move || {
@@ -613,12 +619,12 @@ impl Desktop {
             if preferences.username.is_empty() || password.is_empty() {
                 bail!("请填写 VPN 账号与密码");
             }
+            let pin = certificates::resolve(&preferences.gateway)?;
             let status = service::request(Request::Connect {
                 gateway: preferences.gateway.clone(),
                 username: preferences.username.clone(),
                 password: password.to_string(),
-                cert_sha256: (!preferences.cert_sha256.trim().is_empty())
-                    .then(|| preferences.cert_sha256.trim().to_owned()),
+                cert_sha256: Some(pin),
             })?;
             save(&preferences, &password)?;
             if status.phase == Phase::Failed {
@@ -639,6 +645,7 @@ impl Desktop {
 fn field(title: &'static str, state: &Entity<InputState>) -> Div {
     div()
         .w_full()
+        .min_w_0()
         .flex_shrink_0()
         .flex()
         .flex_col()
@@ -810,7 +817,7 @@ impl Desktop {
             gateway: self.gateway.read(cx).value().to_string(),
             username: self.username.read(cx).value().to_string(),
             remember: self.remember,
-            cert_sha256: self.cert_sha256.read(cx).value().trim().to_owned(),
+            cert_sha256: String::new(),
             auto_login: self.auto_login,
             auto_update: self.auto_update,
             tailscale_client: self.tailscale_client,
@@ -927,8 +934,30 @@ fn toggle(id: &'static str, text: &'static str, checked: bool) -> Stateful<Div> 
 struct LogView {
     live: Arc<Mutex<Live>>,
 }
+// One text view allows selection across log lines. Escape all content so a
+// gateway message can never become a link, image, or formatting instruction.
+fn log_html(logs: &std::collections::VecDeque<String>) -> String {
+    if logs.is_empty() {
+        return "<p>暂无日志</p>".into();
+    }
+    let mut html = String::new();
+    for line in logs {
+        html.push_str("<p>");
+        for ch in line.chars() {
+            match ch {
+                '&' => html.push_str("&amp;"),
+                '<' => html.push_str("&lt;"),
+                '>' => html.push_str("&gt;"),
+                '\n' => html.push_str("<br>"),
+                _ => html.push(ch),
+            }
+        }
+        html.push_str("</p>");
+    }
+    html
+}
 impl Render for LogView {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let logs = self
             .live
             .lock()
@@ -947,8 +976,12 @@ impl Render for LogView {
                     .p(px(12.))
                     .font_family(if cfg!(windows) { "Consolas" } else { "Menlo" })
                     .text_size(px(12.))
-                    .when(logs.is_empty(), |s| s.child("暂无日志"))
-                    .children(logs.into_iter().map(|line| div().mb(px(5.)).child(line))),
+                    .child(
+                        TextView::html("log-text", log_html(&logs), window, cx)
+                            .selectable(true)
+                            .style(TextViewStyle::default().paragraph_gap(gpui::rems(0.3)))
+                            .w_full(),
+                    ),
             )
     }
 }
@@ -1043,7 +1076,10 @@ impl Render for Desktop {
                         "connection-content"
                     })
                     .flex_1()
+                    .w_full()
+                    .min_w_0()
                     .min_h_0()
+                    .overflow_x_hidden()
                     .overflow_y_scroll()
                     .p(px(16.))
                     .when_some(session_end, |s, reason| {
@@ -1102,6 +1138,7 @@ impl Render for Desktop {
                             div()
                                 .id("connection-form")
                                 .w_full()
+                                .min_w_0()
                                 .flex()
                                 .flex_col()
                                 .gap(px(12.))
@@ -1249,6 +1286,8 @@ impl Render for Desktop {
                                 .when(self.advanced, |s| {
                                     s.child(
                                         div()
+                                            .w_full()
+                                            .min_w_0()
                                             .flex()
                                             .flex_col()
                                             .gap(px(12.))
@@ -1259,7 +1298,6 @@ impl Render for Desktop {
                                                 .on_click(cx.listener(|view,_,_,cx|view.switch_tailscale(cx))))
                                             .child(field("Tailscale 子网出口（可选）",&self.tailscale_router))
                                             .child(div().text_color(rgb(0x91a2b4)).child("开启后接收已批准的 IPv4 子网路由，并停用本机 VPN 自动登录。关闭时恢复原来的路由接收设置。"))
-                                            .when(!self.tailscale_client,|s|s.child(field("证书 SHA-256",&self.cert_sha256)))
                                             .child(
                                                 button(
                                                     "manual-change-password",
@@ -1478,6 +1516,19 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn log_content_remains_literal_in_the_selectable_view() {
+        let lines = [
+            "[2026-10-13 12:34:56] <img src=\"https://example.com\"> & **原文**".into(),
+            "第二行\n第三行".into(),
+        ]
+        .into();
+        assert_eq!(
+            log_html(&lines),
+            "<p>[2026-10-13 12:34:56] &lt;img src=\"https://example.com\"&gt; &amp; **原文**</p><p>第二行<br>第三行</p>"
+        );
+    }
+
     #[test]
     fn preferences_never_serialize_passwords() {
         let value = serde_json::to_value(Preferences::default()).unwrap();

@@ -5,6 +5,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      linux_only:
+        description: Build and validate only Linux targets
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -12,6 +17,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   build:
+    if: ${{ !inputs.linux_only }}
     strategy:
       fail-fast: false
       matrix:
@@ -70,6 +76,8 @@ jobs:
           cargo test --locked -p ec-compat --lib session_status::tests --target ${{ matrix.target }}
           cargo test --locked -p ec-compat --lib engine::data_plane::tests --target ${{ matrix.target }}
           cargo test --locked -p ec-compat --lib special_tls11::tests --target ${{ matrix.target }}
+          cargo test --locked -p ec-compat --lib session_renewal --target ${{ matrix.target }}
+          cargo test --locked -p ec-compat --lib engine::session::renewal_tests --target ${{ matrix.target }}
       - name: Clippy
         run: cargo clippy --locked --features desktop --bins --target ${{ matrix.target }} -- -D warnings
       - name: Build release executables
@@ -150,7 +158,16 @@ jobs:
       - name: Test real Linux TUN and SNAT forwarding
         run: |
           sudo target/${{ matrix.target }}/debug/easy-connect tun-self-test
-          sudo target/${{ matrix.target }}/debug/easy-connect tun-self-test --forwarding
+          # Isolate the forwarding test from the runner's Docker/firewall and
+          # explicitly exercise a restrictive forwarding policy.
+          sudo unshare --net bash -euc '
+            iptables -P FORWARD DROP
+            "$1" tun-self-test --forwarding
+            test "$(iptables -S FORWARD)" = "-P FORWARD DROP"
+            test "$(iptables -t nat -S POSTROUTING)" = "-P POSTROUTING ACCEPT"
+            test -z "$(ip netns list)"
+            ! ip link show ectun0
+          ' bash "$PWD/target/${{ matrix.target }}/debug/easy-connect"
       - name: Package Linux CLI
         run: |
           cargo build --locked --release --bin easy-connect --target ${{ matrix.target }}

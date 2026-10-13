@@ -262,6 +262,18 @@ impl GatewaySession {
                     std::thread::sleep(Duration::from_millis(250));
                 }
                 Err(error) => {
+                    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+                    while let Some(current) = cause {
+                        if current
+                            .to_string()
+                            .contains("gateway certificate pin mismatch")
+                        {
+                            return Err(Error(
+                                "网关证书已变化，连接已停止；请联系管理员核实".into(),
+                            ));
+                        }
+                        cause = current.source();
+                    }
                     let kind = if error.is_timeout() {
                         "timeout"
                     } else if error.is_connect() {

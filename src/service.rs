@@ -608,7 +608,10 @@ fn ingest_worker_line(state: &mut Status, line: String) {
 }
 
 fn append_log(state: &mut Status, line: String) {
-    state.logs.push_back(line);
+    // Timestamp once at ingestion, after parsing worker protocol events. UI
+    // refreshes and reopening the log window must not change the event time.
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    state.logs.push_back(format!("[{timestamp}] {line}"));
     while state.logs.len() > 100 || state.logs.iter().map(String::len).sum::<usize>() > 64 * 1024 {
         state.logs.pop_front();
     }
@@ -963,6 +966,29 @@ pub fn run_windows(owner: String) -> Result<()> {
 mod tests {
     use super::*;
     use ec_compat::session_status::SessionEndReason;
+
+    #[test]
+    fn event_timestamps_preserve_worker_state_parsing_and_are_stored_once() {
+        let mut state = Status {
+            phase: Phase::Connecting,
+            ..Default::default()
+        };
+        let message =
+            "TUN ready: utun7, IPv4 10.0.0.2, MTU 1400, 55 routes; TCP/UDP/ICMP forwarding enabled";
+        ingest_worker_line(&mut state, message.into());
+        assert_eq!(state.phase, Phase::Connected);
+        assert_eq!(state.interface.as_deref(), Some("utun7"));
+        assert_eq!(state.routes, 55);
+        let line = state.logs.front().unwrap().clone();
+        assert_eq!(&line[..1], "[");
+        assert_eq!(&line[20..22], "] ");
+        chrono::NaiveDateTime::parse_from_str(&line[1..20], "%Y-%m-%d %H:%M:%S").unwrap();
+        assert_eq!(&line[22..], message);
+        // The RPC payload carries the original timestamp, not a display-time value.
+        let restored: Status =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(restored.logs.front(), Some(&line));
+    }
 
     #[test]
     fn worker_resource_events_do_not_fill_logs_and_are_cleared_on_exit() {
