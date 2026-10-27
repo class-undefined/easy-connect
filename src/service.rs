@@ -127,9 +127,14 @@ fn verify(
         .verify_slice(&bytes)
         .map_err(|_| anyhow::anyhow!("background service authentication failed"))
 }
-fn send_frame(socket: &mut TcpStream, value: &impl Serialize) -> Result<()> {
-    serde_json::to_writer(&mut *socket, value)?;
-    socket.write_all(b"\n")?;
+fn send_frame(socket: &mut impl Write, value: &impl Serialize) -> Result<()> {
+    // Serializing directly to a socket issues a write for each JSON fragment.
+    // Assemble the frame first so escaping a large status does not turn into
+    // thousands of system calls (and small TCP packets on Windows).
+    let mut bytes = Zeroizing::new(Vec::new());
+    serde_json::to_writer(&mut *bytes, value)?;
+    bytes.push(b'\n');
+    socket.write_all(&bytes)?;
     socket.flush()?;
     Ok(())
 }
@@ -348,11 +353,14 @@ impl Drop for SocketGuard {
     }
 }
 pub fn request(request: Request) -> Result<Status> {
+    request_with_timeout(request, Duration::from_secs(5))
+}
+pub(crate) fn request_with_timeout(request: Request, timeout: Duration) -> Result<Status> {
     let owner = current_owner()?;
     let capability = token(&owner)?;
     let mut socket = connect_broker(&owner)?;
-    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
-    socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+    socket.set_read_timeout(Some(timeout))?;
+    socket.set_write_timeout(Some(timeout))?;
     let client = nonce();
     send_frame(
         &mut socket,
@@ -966,6 +974,41 @@ pub fn run_windows(owner: String) -> Result<()> {
 mod tests {
     use super::*;
     use ec_compat::session_status::SessionEndReason;
+
+    #[test]
+    fn escaped_status_is_sent_as_one_complete_frame() -> Result<()> {
+        #[derive(Default)]
+        struct Writer {
+            bytes: Vec<u8>,
+            writes: usize,
+        }
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut status = Status::default();
+        status
+            .logs
+            .push_back("日志 \"quoted\" \\path\n".repeat(4096));
+        let frame = Frame {
+            payload: serde_json::to_string(&status)?,
+            proof: "0".repeat(64),
+        };
+        let mut writer = Writer::default();
+        send_frame(&mut writer, &frame)?;
+        assert_eq!(writer.writes, 1);
+        assert_eq!(writer.bytes.last(), Some(&b'\n'));
+        let decoded: Frame = serde_json::from_slice(&writer.bytes)?;
+        assert_eq!(decoded.payload, frame.payload);
+        assert_eq!(decoded.proof, frame.proof);
+        Ok(())
+    }
 
     #[test]
     fn event_timestamps_preserve_worker_state_parsing_and_are_stored_once() {

@@ -129,6 +129,9 @@ pub(super) struct Controller {
 const POLL: Duration = Duration::from_millis(750);
 const RETRY: Duration = Duration::from_millis(250);
 const WAIT_ATTEMPTS: usize = 120;
+const SERVICE_GRACE: Duration = Duration::from_secs(2);
+const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(30);
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 fn inactive(status: &Status) -> bool {
     matches!(status.phase, Phase::Disconnected | Phase::Failed)
@@ -329,7 +332,10 @@ fn prepare(live: &Arc<Mutex<Live>>) {
         state.notice = None;
     }
     let result = ensure_service(
-        &mut service::request,
+        &mut |request| match request {
+            Request::Status => service::request_with_timeout(request, PROBE_TIMEOUT),
+            _ => service::request(request),
+        },
         install_service,
         &mut || std::thread::sleep(RETRY),
         |readiness| {
@@ -372,10 +378,20 @@ fn ensure_service(
     sleep: &mut impl FnMut(),
     progress: impl Fn(Readiness),
 ) -> Result<Status> {
+    ensure_service_with_clock(request, install, sleep, progress, Instant::now)
+}
+fn ensure_service_with_clock(
+    request: &mut impl FnMut(Request) -> Result<Status>,
+    install: impl FnOnce() -> Result<()>,
+    sleep: &mut impl FnMut(),
+    progress: impl Fn(Readiness),
+    now: impl Fn() -> Instant,
+) -> Result<Status> {
     // Give launchd/SCM a short grace period to recover before requesting elevation.
+    let grace_deadline = now() + SERVICE_GRACE;
     let mut status = request(Request::Status).ok();
     for _ in 0..8 {
-        if status.is_some() {
+        if status.is_some() || now() >= grace_deadline {
             break;
         }
         sleep();
@@ -396,6 +412,7 @@ fn ensure_service(
         }
     }
     install()?;
+    let startup_deadline = now() + SERVICE_START_TIMEOUT;
     let mut last_error = anyhow::anyhow!("后台未返回状态");
     for _ in 0..WAIT_ATTEMPTS {
         match request(Request::Status) {
@@ -404,6 +421,11 @@ fn ensure_service(
                 last_error = anyhow::anyhow!("后台版本不匹配：{}", status.version);
             }
             Err(error) => last_error = error,
+        }
+        // Count wall time, including IPC, rather than adding a full timeout to
+        // every retry. An unresponsive broker used to keep this UI busy for minutes.
+        if now() >= startup_deadline {
+            break;
         }
         sleep();
     }
@@ -693,11 +715,62 @@ mod tests {
         let result = ensure_service(
             &mut |_| Ok(ready.clone()),
             || panic!("must not reinstall"),
-            &mut || {},
+            &mut || panic!("a ready service must not wait"),
             |_| {},
         )
         .unwrap();
         assert_eq!(result.phase, Phase::Connected);
+    }
+    #[test]
+    fn slow_probes_consume_the_grace_and_startup_budgets() {
+        use std::cell::Cell;
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let calls = Cell::new(0);
+        let mut sleeps = 0;
+        let mut installs = 0;
+        let error = ensure_service_with_clock(
+            &mut |_| {
+                calls.set(calls.get() + 1);
+                elapsed.set(elapsed.get() + Duration::from_secs(10));
+                bail!("unresponsive broker")
+            },
+            || {
+                installs += 1;
+                Ok(())
+            },
+            &mut || sleeps += 1,
+            |_| {},
+            || start + elapsed.get(),
+        )
+        .unwrap_err();
+        // One initial probe exhausts the grace period, then three probes use
+        // the 30-second startup budget. Never run all 129 status requests.
+        assert_eq!(calls.get(), 4);
+        assert_eq!(installs, 1);
+        assert_eq!(sleeps, 2);
+        assert!(format!("{error:#}").contains("unresponsive broker"));
+    }
+    #[test]
+    fn service_recovering_during_grace_does_not_require_authorization() {
+        let mut calls = 0;
+        let mut sleeps = 0;
+        let result = ensure_service(
+            &mut |_| {
+                calls += 1;
+                if calls < 3 {
+                    bail!("starting")
+                }
+                Ok(Status::default())
+            },
+            || panic!("recovering service must not reinstall"),
+            &mut || sleeps += 1,
+            |_| {},
+        )
+        .unwrap();
+        assert!(current_version(&result));
+        assert_eq!(calls, 3);
+        assert_eq!(sleeps, 2);
     }
     #[test]
     fn upgrade_waits_for_disconnect_before_installing_and_for_new_service() {

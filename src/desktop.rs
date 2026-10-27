@@ -326,6 +326,13 @@ impl Desktop {
             .and_then(|p| std::fs::read(p).ok())
             .and_then(|b| serde_json::from_slice::<Preferences>(&b).ok())
             .unwrap_or_default();
+        // Probe the broker while the UI and OS credential store initialize.
+        // Keychain access must not delay starting environment preparation.
+        let controller = if preferences.tailscale_client {
+            Controller::for_tailscale()
+        } else {
+            Controller::new()
+        };
         let gateway =
             cx.new(|cx| InputState::new(window, cx).placeholder("https://vpn.example.com:443"));
         let username = cx.new(|cx| InputState::new(window, cx).placeholder("VPN 账号"));
@@ -421,11 +428,7 @@ impl Desktop {
             logs_item,
             about_item,
             updates_item,
-            controller: if preferences.tailscale_client {
-                Controller::for_tailscale()
-            } else {
-                Controller::new()
-            },
+            controller,
             tray,
             show,
             disconnect,
