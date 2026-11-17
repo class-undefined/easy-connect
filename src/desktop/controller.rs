@@ -83,6 +83,7 @@ impl Live {
             Readiness::Updating => "正在更新…",
             Readiness::Failed => "暂不可连接",
             Readiness::Ready => match self.phase() {
+                Some(Phase::Connecting) if self.reconnecting() => "取消重连",
                 Some(Phase::Connecting) => "取消连接",
                 Some(Phase::Connected) => "断开连接",
                 Some(Phase::Stopping) => "正在断开…",
@@ -90,6 +91,13 @@ impl Live {
                 _ => "连接",
             },
         }
+    }
+    pub(super) fn reconnecting(&self) -> bool {
+        self.phase() == Some(Phase::Connecting)
+            && self
+                .status
+                .as_ref()
+                .is_some_and(|s| s.reconnect_attempt > 0)
     }
     pub(super) fn loading(&self) -> bool {
         self.busy
@@ -133,6 +141,35 @@ const SERVICE_GRACE: Duration = Duration::from_secs(2);
 const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
+#[derive(Default)]
+struct ServiceSetup {
+    installed_version: Option<String>,
+    repair: bool,
+}
+
+impl ServiceSetup {
+    fn for_launch(repair: bool) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            let installed_version = match service::installed_macos_version() {
+                Ok(version) => version,
+                // Only an explicit retry may repair an unreadable installation.
+                Err(_) if repair => None,
+                Err(error) => return Err(error),
+            };
+            Ok(Self {
+                installed_version,
+                repair,
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = repair;
+            Ok(Self::default())
+        }
+    }
+}
+
 fn inactive(status: &Status) -> bool {
     matches!(status.phase, Phase::Disconnected | Phase::Failed)
 }
@@ -160,7 +197,7 @@ impl Controller {
         let state = live.clone();
         std::thread::spawn(move || {
             if native {
-                prepare(&state);
+                prepare(&state, false);
             }
             loop {
                 match receiver.recv_timeout(POLL) {
@@ -177,7 +214,7 @@ impl Controller {
                     }
                     Ok(Command::Prepare) => {
                         if native {
-                            prepare(&state);
+                            prepare(&state, true);
                         }
                     }
                     Ok(Command::Quit(install)) => {
@@ -325,25 +362,28 @@ fn finish_exit(
     }
     install.map_or(Ok(()), |work| work())
 }
-fn prepare(live: &Arc<Mutex<Live>>) {
+fn prepare(live: &Arc<Mutex<Live>>, repair: bool) {
     if let Ok(mut state) = live.lock() {
         state.readiness = Readiness::Preparing;
         state.status = None;
         state.notice = None;
     }
-    let result = ensure_service(
-        &mut |request| match request {
-            Request::Status => service::request_with_timeout(request, PROBE_TIMEOUT),
-            _ => service::request(request),
-        },
-        install_service,
-        &mut || std::thread::sleep(RETRY),
-        |readiness| {
-            if let Ok(mut state) = live.lock() {
-                state.readiness = readiness;
-            }
-        },
-    );
+    let result = ServiceSetup::for_launch(repair).and_then(|setup| {
+        ensure_service(
+            &mut |request| match request {
+                Request::Status => service::request_with_timeout(request, PROBE_TIMEOUT),
+                _ => service::request(request),
+            },
+            install_service,
+            &mut || std::thread::sleep(RETRY),
+            |readiness| {
+                if let Ok(mut state) = live.lock() {
+                    state.readiness = readiness;
+                }
+            },
+            setup,
+        )
+    });
     if let Ok(mut state) = live.lock() {
         match result {
             Ok(status) => {
@@ -377,8 +417,9 @@ fn ensure_service(
     install: impl FnOnce() -> Result<()>,
     sleep: &mut impl FnMut(),
     progress: impl Fn(Readiness),
+    setup: ServiceSetup,
 ) -> Result<Status> {
-    ensure_service_with_clock(request, install, sleep, progress, Instant::now)
+    ensure_service_with_clock(request, install, sleep, progress, Instant::now, setup)
 }
 fn ensure_service_with_clock(
     request: &mut impl FnMut(Request) -> Result<Status>,
@@ -386,18 +427,26 @@ fn ensure_service_with_clock(
     sleep: &mut impl FnMut(),
     progress: impl Fn(Readiness),
     now: impl Fn() -> Instant,
+    setup: ServiceSetup,
 ) -> Result<Status> {
-    // Give launchd/SCM a short grace period to recover before requesting elevation.
-    let grace_deadline = now() + SERVICE_GRACE;
-    let mut status = request(Request::Status).ok();
-    for _ in 0..8 {
-        if status.is_some() || now() >= grace_deadline {
+    // Installed macOS helpers recover through launchd without elevation. Allow
+    // its boot/restart backoff instead of treating a brief outage as a reinstall.
+    let installed = setup.installed_version.is_some();
+    let grace_deadline = now()
+        + if installed {
+            SERVICE_START_TIMEOUT
+        } else {
+            SERVICE_GRACE
+        };
+    let mut status = request(Request::Status);
+    for _ in 0..if installed { WAIT_ATTEMPTS } else { 8 } {
+        if status.is_ok() || now() >= grace_deadline {
             break;
         }
         sleep();
-        status = request(Request::Status).ok();
+        status = request(Request::Status);
     }
-    if let Some(status) = status {
+    if let Ok(status) = status {
         if current_version(&status) {
             return Ok(status);
         }
@@ -410,6 +459,16 @@ fn ensure_service_with_clock(
         if !inactive(&status) {
             disconnect_and_wait(request, sleep)?;
         }
+    } else if let Some(version) = setup.installed_version {
+        if semver::Version::parse(&version)? > semver::Version::parse(env!("CARGO_PKG_VERSION"))? {
+            bail!("后台已由较新版本管理，请打开最新版应用");
+        }
+        if version == env!("CARGO_PKG_VERSION") && !setup.repair {
+            return status.context(
+                "已安装的后台服务暂不可用；请检查系统设置是否允许后台运行，或点击重试修复",
+            );
+        }
+        progress(Readiness::Updating);
     }
     install()?;
     let startup_deadline = now() + SERVICE_START_TIMEOUT;
@@ -435,6 +494,26 @@ fn ensure_service_with_clock(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_reconnect_exposes_a_cancel_action_while_waiting() {
+        let mut live = Live {
+            readiness: Readiness::Ready,
+            status: Some(Status {
+                phase: Phase::Connecting,
+                reconnect_attempt: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(live.reconnecting());
+        assert_eq!(live.connect_label(), "取消重连");
+        assert!(live.can_disconnect());
+        assert!(!live.can_connect());
+        live.pending = Some(Phase::Stopping);
+        assert!(!live.reconnecting());
+        assert_eq!(live.connect_label(), "正在断开…");
+    }
     #[test]
     fn client_mode_runs_actions_and_exits_without_preparing_native_service() {
         let controller = Controller::for_tailscale();
@@ -582,6 +661,7 @@ mod tests {
             },
             &mut || {},
             |_| {},
+            ServiceSetup::default(),
         )
         .unwrap_err();
         assert_eq!(installs.get(), 1);
@@ -704,6 +784,7 @@ mod tests {
                 },
                 &mut || {},
                 |_| {},
+                ServiceSetup::default(),
             )
             .is_err()
         );
@@ -717,6 +798,7 @@ mod tests {
             || panic!("must not reinstall"),
             &mut || panic!("a ready service must not wait"),
             |_| {},
+            ServiceSetup::default(),
         )
         .unwrap();
         assert_eq!(result.phase, Phase::Connected);
@@ -742,6 +824,7 @@ mod tests {
             &mut || sleeps += 1,
             |_| {},
             || start + elapsed.get(),
+            ServiceSetup::default(),
         )
         .unwrap_err();
         // One initial probe exhausts the grace period, then three probes use
@@ -766,6 +849,7 @@ mod tests {
             || panic!("recovering service must not reinstall"),
             &mut || sleeps += 1,
             |_| {},
+            ServiceSetup::default(),
         )
         .unwrap();
         assert!(current_version(&result));
@@ -811,6 +895,7 @@ mod tests {
             },
             &mut || {},
             |s| progress.set(s),
+            ServiceSetup::default(),
         )
         .unwrap();
         assert!(current_version(&result));
@@ -834,6 +919,7 @@ mod tests {
             },
             &mut || {},
             |_| {},
+            ServiceSetup::default(),
         )
         .unwrap();
         assert!(current_version(&result));
@@ -842,6 +928,7 @@ mod tests {
             || bail!("授权取消"),
             &mut || {},
             |_| {},
+            ServiceSetup::default(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("授权取消"));
@@ -853,7 +940,8 @@ mod tests {
                 &mut |_| Ok(status(Phase::Stopping, "0.0.1")),
                 || panic!("must not replace active worker"),
                 &mut || {},
-                |_| {}
+                |_| {},
+                ServiceSetup::default(),
             )
             .is_err()
         );
@@ -865,9 +953,125 @@ mod tests {
                 &mut |_| Ok(status(Phase::Connected, "99.0.0")),
                 || panic!("must not downgrade"),
                 &mut || {},
-                |_| {}
+                |_| {},
+                ServiceSetup::default(),
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn installed_service_can_recover_after_the_old_two_second_grace_without_elevation() {
+        use std::cell::Cell;
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let result = ensure_service_with_clock(
+            &mut |_| {
+                if elapsed.get() < Duration::from_secs(10) {
+                    bail!("launchd is restarting the helper");
+                }
+                Ok(Status::default())
+            },
+            || panic!("an installed helper must recover without authorization"),
+            &mut || elapsed.set(elapsed.get() + RETRY),
+            |_| {},
+            || start + elapsed.get(),
+            ServiceSetup {
+                installed_version: Some(env!("CARGO_PKG_VERSION").into()),
+                repair: false,
+            },
+        )
+        .unwrap();
+        assert!(current_version(&result));
+        assert_eq!(elapsed.get(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn unavailable_current_service_never_reauthorizes_on_repeated_launches() {
+        use std::cell::Cell;
+        for _ in 0..3 {
+            let start = Instant::now();
+            let elapsed = Cell::new(Duration::ZERO);
+            let error = ensure_service_with_clock(
+                &mut |_| {
+                    elapsed.set(elapsed.get() + PROBE_TIMEOUT);
+                    bail!("service socket unavailable");
+                },
+                || panic!("launching an installed app must not request authorization again"),
+                &mut || elapsed.set(elapsed.get() + RETRY),
+                |_| {},
+                || start + elapsed.get(),
+                ServiceSetup {
+                    installed_version: Some(env!("CARGO_PKG_VERSION").into()),
+                    repair: false,
+                },
+            )
+            .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("点击重试修复"));
+            assert!(message.contains("service socket unavailable"));
+            assert!(elapsed.get() >= SERVICE_START_TIMEOUT);
+            assert!(elapsed.get() < SERVICE_START_TIMEOUT + RETRY + PROBE_TIMEOUT);
+        }
+    }
+
+    #[test]
+    fn explicit_retry_can_repair_an_unavailable_current_service_once() {
+        use std::cell::Cell;
+        let installs = Cell::new(0);
+        let result = ensure_service(
+            &mut |_| {
+                if installs.get() == 0 {
+                    bail!("service disabled");
+                }
+                Ok(Status::default())
+            },
+            || {
+                installs.set(installs.get() + 1);
+                Ok(())
+            },
+            &mut || {},
+            |_| {},
+            ServiceSetup {
+                installed_version: Some(env!("CARGO_PKG_VERSION").into()),
+                repair: true,
+            },
+        )
+        .unwrap();
+        assert!(current_version(&result));
+        assert_eq!(installs.get(), 1);
+    }
+
+    #[test]
+    fn offline_helper_version_allows_an_upgrade_but_never_a_downgrade() {
+        use std::cell::Cell;
+        for version in ["0.0.1", "99.0.0"] {
+            let installs = Cell::new(0);
+            let result = ensure_service(
+                &mut |_| {
+                    if installs.get() == 0 {
+                        bail!("offline");
+                    }
+                    Ok(Status::default())
+                },
+                || {
+                    installs.set(installs.get() + 1);
+                    Ok(())
+                },
+                &mut || {},
+                |_| {},
+                ServiceSetup {
+                    installed_version: Some(version.into()),
+                    repair: false,
+                },
+            );
+            if version == "0.0.1" {
+                assert!(current_version(&result.unwrap()));
+                assert_eq!(installs.get(), 1);
+            } else {
+                assert!(result.unwrap_err().to_string().contains("较新版本"));
+                assert_eq!(installs.get(), 0);
+            }
+        }
     }
 }

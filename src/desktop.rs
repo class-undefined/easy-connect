@@ -562,19 +562,20 @@ impl Desktop {
             let _ = logs.update(cx, |_, _, cx| cx.refresh_windows());
         }
 
-        let (phase, can_disconnect) = self
+        let (phase, can_disconnect, reconnecting) = self
             .controller
             .live
             .lock()
-            .map(|s| (s.phase(), s.can_disconnect()))
+            .map(|s| (s.phase(), s.can_disconnect(), s.reconnecting()))
             .unwrap_or_default();
         let _ = self.tray.set_icon(Some(
             tray_icon(phase == Some(Phase::Connected))
                 .unwrap_or_else(|_| self.tray_icon_fallback()),
         ));
-        let _ = self
-            .tray
-            .set_tooltip(Some(format!("EasyConnect · {}", phase_style(phase).0)));
+        let _ = self.tray.set_tooltip(Some(format!(
+            "EasyConnect · {}",
+            phase_style(phase, reconnecting).0
+        )));
         self.disconnect.set_enabled(can_disconnect);
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             let command = if event.id == *self.show.id() {
@@ -904,9 +905,10 @@ impl Desktop {
     }
 }
 
-fn phase_style(phase: Option<Phase>) -> (&'static str, u32) {
+fn phase_style(phase: Option<Phase>, reconnecting: bool) -> (&'static str, u32) {
     match phase {
         Some(Phase::Connected) => ("已连接", 0x72cfa7),
+        Some(Phase::Connecting) if reconnecting => ("正在重连", 0xe1ad68),
         Some(Phase::Connecting) => ("连接中", 0xe1ad68),
         Some(Phase::Stopping) => ("正在断开", 0xe1ad68),
         Some(Phase::Failed) => ("连接失败", 0xf87171),
@@ -968,23 +970,23 @@ impl Render for LogView {
             .and_then(|s| s.status.as_ref().map(|s| s.logs.clone()))
             .unwrap_or_default();
         div()
+            .id("event-log")
             .size_full()
             .bg(rgb(0x10161e))
             .text_color(rgb(0xdce6ee))
+            .p(px(12.))
+            .overflow_hidden()
+            .font_family(if cfg!(windows) { "Consolas" } else { "Menlo" })
+            .text_size(px(12.))
             .child(
-                div()
-                    .id("event-log")
+                // TextView reports the viewport's height. Its own virtual list
+                // must scroll; an outer div cannot see the document's overflow.
+                TextView::html("log-text", log_html(&logs), window, cx)
+                    .scrollable(true)
+                    .selectable(true)
+                    .style(TextViewStyle::default().paragraph_gap(gpui::rems(0.3)))
                     .size_full()
-                    .overflow_y_scroll()
-                    .p(px(12.))
-                    .font_family(if cfg!(windows) { "Consolas" } else { "Menlo" })
-                    .text_size(px(12.))
-                    .child(
-                        TextView::html("log-text", log_html(&logs), window, cx)
-                            .selectable(true)
-                            .style(TextViewStyle::default().paragraph_gap(gpui::rems(0.3)))
-                            .w_full(),
-                    ),
+                    .min_h_0(),
             )
     }
 }
@@ -1016,6 +1018,7 @@ impl Render for Desktop {
         let loading =
             live.as_ref().is_some_and(|s| s.loading()) && phase != Some(Phase::Connecting);
         let notice = live.as_ref().and_then(|s| s.notice.clone());
+        let reconnecting = live.as_ref().is_some_and(|s| s.reconnecting());
         drop(live);
         let session_end = status
             .as_ref()
@@ -1027,7 +1030,7 @@ impl Render for Desktop {
         } else if session_end.is_some() {
             ("连接已结束", 0xe1ad68)
         } else {
-            phase_style(phase)
+            phase_style(phase, reconnecting)
         };
         let update = self.updates.lock().map(|s| s.clone()).unwrap_or_default();
         let update_label = update.label();

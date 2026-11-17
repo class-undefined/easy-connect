@@ -20,6 +20,44 @@ const STOP_POLLS: usize = 120;
 const BOOTSTRAP_ATTEMPTS: usize = 3;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Inspect the persistent helper, even before launchd has opened its socket.
+/// A missing or slow socket alone must not trigger another authorization prompt.
+#[cfg(feature = "desktop")]
+pub(super) fn installed_version() -> Result<Option<String>> {
+    let metadata = match std::fs::symlink_metadata(HELPER) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if Path::new(PLIST).try_exists()?
+                || super::token_path(&super::current_owner()?)?.try_exists()?
+            {
+                bail!("后台服务安装不完整，请点击重试修复");
+            }
+            return Ok(None);
+        }
+        Err(error) => return Err(error).context("无法检查已安装的后台程序"),
+    };
+    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        bail!("后台程序的所有者或权限异常，请点击重试修复");
+    }
+    let output = Command::new(HELPER)
+        .arg("--version")
+        .output()
+        .context("无法读取已安装的后台版本，请点击重试修复")?;
+    if !output.status.success() {
+        bail!(
+            "无法读取已安装的后台版本：{}；请点击重试修复",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let version = String::from_utf8(output.stdout)?;
+    let version = version
+        .trim()
+        .strip_prefix("easy-connect ")
+        .filter(|version| !version.is_empty())
+        .context("已安装的后台版本无效，请点击重试修复")?;
+    Ok(Some(version.to_owned()))
+}
+
 struct CommandOutput {
     code: Option<i32>,
     stdout: String,

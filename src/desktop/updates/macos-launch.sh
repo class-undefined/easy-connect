@@ -10,10 +10,10 @@ while /bin/kill -0 "$parent_pid" 2>/dev/null; do
     /bin/sleep 0.2
 done
 apply() {
-    /bin/sh "$job/apply.sh" "$staged" "$destination" "$incoming" "$backup" "$1"
+    /bin/sh "$job/apply.sh" "$staged" "$destination" "$incoming" "$backup" "$1" "$owner"
     code=$?
     if [ "$code" -eq 77 ]; then
-        /usr/bin/osascript "$job/elevate.applescript" "$job/apply.sh" "$staged" "$destination" "$incoming" "$backup" "$1"
+        /usr/bin/osascript "$job/elevate.applescript" "$job/apply.sh" "$staged" "$destination" "$incoming" "$backup" "$1" "$owner"
         return $?
     fi
     return "$code"

@@ -19,11 +19,14 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use zeroize::{Zeroize, Zeroizing};
 #[cfg(target_os = "macos")]
 mod macos_install;
+mod reconnect;
+use reconnect::Reconnect;
+pub(crate) const TRANSIENT_FAILURE_EVENT: &str = "EC_TRANSIENT_CONNECTION_FAILURE";
 #[cfg(target_os = "windows")]
 const PORT: u16 = 40571;
 const LIMIT: u64 = 16384;
@@ -175,6 +178,8 @@ pub struct Status {
     pub resource_catalog: crate::resources::ResourceCatalog,
     #[serde(default)]
     pub session_end: Option<ec_compat::session_status::SessionEndReason>,
+    #[serde(default)]
+    pub reconnect_attempt: usize,
 }
 impl Default for Status {
     fn default() -> Self {
@@ -190,6 +195,7 @@ impl Default for Status {
             password_policy: None,
             resource_catalog: Default::default(),
             session_end: None,
+            reconnect_attempt: 0,
         }
     }
 }
@@ -429,13 +435,37 @@ fn validate_credentials(
     }
     Ok(())
 }
+// Kept only for this active connection, including network recovery. Never
+// serialized, logged, passed as arguments, or retained after a user disconnect.
+struct Connection {
+    gateway: String,
+    username: String,
+    password: Zeroizing<String>,
+    cert_sha256: Option<String>,
+}
+
 struct Worker {
     child: Option<Child>,
     input: Option<ChildStdin>,
     status: Arc<Mutex<Status>>,
     log_readers: Vec<std::thread::JoinHandle<()>>,
+    connection: Option<Connection>,
+    reconnect: Reconnect,
+    transient_failure: Arc<AtomicBool>,
 }
 impl Worker {
+    fn new() -> Self {
+        Self {
+            child: None,
+            input: None,
+            status: Arc::new(Mutex::new(Status::default())),
+            log_readers: Vec::new(),
+            connection: None,
+            reconnect: Reconnect::default(),
+            transient_failure: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     fn refresh(&mut self) -> Result<()> {
         if let Some(child) = &mut self.child
             && let Some(exit) = child.try_wait()?
@@ -449,15 +479,167 @@ impl Worker {
             for reader in self.log_readers.drain(..) {
                 let _ = reader.join();
             }
-            let mut s = self
-                .status
-                .lock()
-                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
-            finish_worker(&mut s, exit.success());
+            self.finished(exit.success(), Instant::now())?;
         }
         Ok(())
     }
+
+    fn finished(&mut self, success: bool, now: Instant) -> Result<()> {
+        let mut state = self
+            .status
+            .lock()
+            .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+        if state.phase == Phase::Connected && self.connection.is_some() {
+            self.reconnect.connected();
+        }
+        finish_worker(&mut state, success);
+        let transient = self.transient_failure.swap(false, Ordering::Relaxed);
+        let delay = self
+            .connection
+            .as_ref()
+            .and_then(|_| self.reconnect.schedule(state.session_end, transient, now));
+        if let Some(delay) = delay {
+            state.phase = Phase::Connecting;
+            state.session_end = None;
+            state.reconnect_attempt = self.reconnect.attempt();
+            let attempt = state.reconnect_attempt;
+            append_log(
+                &mut state,
+                format!(
+                    "连接已中断，{} 秒后自动重连（第 {} 次）；可点击取消重连。",
+                    delay.as_secs(),
+                    attempt,
+                ),
+            );
+        } else {
+            if state.reconnect_attempt > 0 {
+                append_log(
+                    &mut state,
+                    "自动重连已停止，请查看失败原因后手动连接。".into(),
+                );
+            }
+            state.reconnect_attempt = 0;
+            self.reconnect.cancel();
+            self.connection = None;
+        }
+        Ok(())
+    }
+
+    fn reconnect_if_due(&mut self, now: Instant) -> Result<()> {
+        if self.child.is_some() || !self.reconnect.take_due(now) {
+            return Ok(());
+        }
+        let Some(connection) = self.connection.take() else {
+            self.reconnect.cancel();
+            return Ok(());
+        };
+        match self.start(&connection, true) {
+            Ok(()) => self.connection = Some(connection),
+            Err(error) => {
+                self.reconnect.cancel();
+                let mut state = self
+                    .status
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+                state.phase = Phase::Failed;
+                append_log(&mut state, format!("自动重连无法启动：{error:#}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn start(&mut self, connection: &Connection, preserve_logs: bool) -> Result<()> {
+        #[cfg(not(target_os = "windows"))]
+        let mut command = Command::new(std::env::current_exe()?);
+        #[cfg(target_os = "windows")]
+        let mut command = crate::windows::command(std::env::current_exe()?);
+        command
+            .args([
+                "connect",
+                "--gateway",
+                &connection.gateway,
+                "--mode",
+                "tun",
+                "--credentials-stdin",
+                "--shutdown-stdin",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(pin) = &connection.cert_sha256 {
+            command.args(["--cert-sha256", pin]);
+        }
+        // Obtain the state lock before creating a process. A poisoned state
+        // must not leave an untracked worker with an open credential pipe.
+        let mut state = self
+            .status
+            .lock()
+            .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+        let mut child = command.spawn()?;
+        let mut input = match child.stdin.take() {
+            Some(input) => input,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("worker input missing");
+            }
+        };
+        let bytes = Zeroizing::new(format!(
+            "{}\n{}\n",
+            connection.username,
+            connection.password.as_str()
+        ));
+        if let Err(error) = input
+            .write_all(bytes.as_bytes())
+            .and_then(|_| input.flush())
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error.into());
+        }
+        self.transient_failure.store(false, Ordering::Relaxed);
+        let previous_logs = if preserve_logs {
+            std::mem::take(&mut state.logs)
+        } else {
+            VecDeque::new()
+        };
+        *state = Status {
+            phase: Phase::Connecting,
+            reconnect_attempt: self.reconnect.attempt(),
+            logs: previous_logs,
+            ..Default::default()
+        };
+        if preserve_logs {
+            let attempt = state.reconnect_attempt;
+            append_log(&mut state, format!("正在自动重连（第 {attempt} 次）…"));
+        }
+        drop(state);
+        if let Some(out) = child.stdout.take() {
+            self.log_readers.push(logs(
+                out,
+                self.status.clone(),
+                self.transient_failure.clone(),
+            ));
+        }
+        if let Some(out) = child.stderr.take() {
+            self.log_readers.push(logs(
+                out,
+                self.status.clone(),
+                self.transient_failure.clone(),
+            ));
+        }
+        self.child = Some(child);
+        self.input = Some(input);
+        Ok(())
+    }
+
     fn handle(&mut self, request: &Request) -> Result<Status> {
+        // Cancel the timer and erase credentials BEFORE refreshing an exited
+        // worker. A disconnect racing the retry deadline must never log in again.
+        if matches!(request, Request::Disconnect) {
+            self.reconnect.cancel();
+            self.connection = None;
+        }
         self.refresh()?;
         match request {
             Request::Status => {}
@@ -468,8 +650,11 @@ impl Worker {
                         .lock()
                         .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
                     state.session_end = None;
+                    state.reconnect_attempt = 0;
                     if self.child.is_some() {
                         state.phase = Phase::Stopping;
+                    } else {
+                        state.phase = Phase::Disconnected;
                     }
                 }
                 if let Some(input) = &mut self.input
@@ -485,54 +670,19 @@ impl Worker {
                 password,
                 cert_sha256,
             } => {
-                if self.child.is_some() {
+                if self.child.is_some() || self.reconnect.pending() {
                     bail!("disconnect the active connection first");
                 }
                 validate_credentials(gateway, username, password, cert_sha256.as_deref())?;
-                #[cfg(not(target_os = "windows"))]
-                let mut command = Command::new(std::env::current_exe()?);
-                #[cfg(target_os = "windows")]
-                let mut command = crate::windows::command(std::env::current_exe()?);
-                command
-                    .args([
-                        "connect",
-                        "--gateway",
-                        gateway,
-                        "--mode",
-                        "tun",
-                        "--credentials-stdin",
-                        "--shutdown-stdin",
-                    ])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                if let Some(pin) = cert_sha256 {
-                    command.args(["--cert-sha256", pin]);
-                }
-                let mut child = command.spawn()?;
-                let mut input = child.stdin.take().context("worker input missing")?;
-                let bytes = Zeroizing::new(format!("{username}\n{password}\n"));
-                if let Err(error) = input.write_all(bytes.as_bytes()) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error.into());
-                }
-                input.flush()?;
-                *self
-                    .status
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("state lock poisoned"))? = Status {
-                    phase: Phase::Connecting,
-                    ..Default::default()
+                let connection = Connection {
+                    gateway: gateway.clone(),
+                    username: username.clone(),
+                    password: Zeroizing::new(password.clone()),
+                    cert_sha256: cert_sha256.clone(),
                 };
-                if let Some(out) = child.stdout.take() {
-                    self.log_readers.push(logs(out, self.status.clone()));
-                }
-                if let Some(out) = child.stderr.take() {
-                    self.log_readers.push(logs(out, self.status.clone()));
-                }
-                self.child = Some(child);
-                self.input = Some(input);
+                self.reconnect.cancel();
+                self.start(&connection, false)?;
+                self.connection = Some(connection);
             }
         }
         Ok(self
@@ -599,6 +749,10 @@ fn ingest_worker_line(state: &mut Status, line: String) {
     let words: Vec<_> = line.split_whitespace().collect();
     if line.starts_with("TUN ready:") && state.phase == Phase::Connecting {
         state.phase = Phase::Connected;
+        if state.reconnect_attempt > 0 {
+            append_log(state, "自动重连成功。".into());
+            state.reconnect_attempt = 0;
+        }
         state.interface = words.get(2).map(|s| s.trim_end_matches(',').into());
         state.address = words.get(4).map(|s| s.trim_end_matches(',').into());
         state.routes = words.get(7).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -623,6 +777,7 @@ fn append_log(state: &mut Status, line: String) {
 fn logs(
     reader: impl Read + Send + 'static,
     state: Arc<Mutex<Status>>,
+    transient_failure: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(reader);
@@ -633,6 +788,10 @@ fn logs(
                 _ => {}
             }
             let line = String::from_utf8_lossy(&bytes).trim().to_owned();
+            if line == TRANSIENT_FAILURE_EVENT {
+                transient_failure.store(true, Ordering::Relaxed);
+                continue;
+            }
             let Ok(mut state) = state.lock() else {
                 break;
             };
@@ -707,12 +866,7 @@ pub fn run(owner: &str, stop: Arc<AtomicBool>) -> Result<()> {
         (listener, SocketGuard(path))
     };
     listener.set_nonblocking(true)?;
-    let mut worker = Worker {
-        child: None,
-        input: None,
-        status: Arc::new(Mutex::new(Status::default())),
-        log_readers: Vec::new(),
-    };
+    let mut worker = Worker::new();
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((mut socket, peer)) => {
@@ -757,6 +911,9 @@ pub fn run(owner: &str, stop: Arc<AtomicBool>) -> Result<()> {
             Err(error) => return Err(error.into()),
         }
         worker.refresh()?;
+        if !stop.load(Ordering::Relaxed) {
+            worker.reconnect_if_due(Instant::now())?;
+        }
     }
     Ok(())
 }
@@ -813,6 +970,10 @@ pub fn install(_: &str) -> Result<()> {
 #[cfg(target_os = "macos")]
 fn install_macos(owner: &str, token: &std::path::Path) -> Result<()> {
     macos_install::install(owner, token)
+}
+#[cfg(all(target_os = "macos", feature = "desktop"))]
+pub(crate) fn installed_macos_version() -> Result<Option<String>> {
+    macos_install::installed_version()
 }
 #[cfg(target_os = "windows")]
 fn stop_windows_service() -> Result<()> {
@@ -970,6 +1131,124 @@ mod tests {
     use super::*;
     use ec_compat::session_status::SessionEndReason;
 
+    fn connected_worker(reason: SessionEndReason) -> Worker {
+        let mut worker = Worker::new();
+        worker.connection = Some(Connection {
+            gateway: "https://example.com".into(),
+            username: "test-user".into(),
+            password: Zeroizing::new("test-password".into()),
+            cert_sha256: Some("ab".repeat(32)),
+        });
+        *worker.status.lock().unwrap() = Status {
+            phase: Phase::Connected,
+            interface: Some("test-tun".into()),
+            address: Some("192.0.2.5".into()),
+            session_end: Some(reason),
+            logs: VecDeque::from(["previous session event".into()]),
+            ..Default::default()
+        };
+        worker
+    }
+
+    #[test]
+    fn connection_loss_and_session_timeout_schedule_a_cancellable_relogin() -> Result<()> {
+        let now = Instant::now();
+        for reason in [SessionEndReason::ConnectionLost, SessionEndReason::Timeout] {
+            let mut worker = connected_worker(reason);
+            worker.finished(false, now)?;
+            {
+                let state = worker.status.lock().unwrap();
+                assert_eq!(state.phase, Phase::Connecting);
+                assert_eq!(state.reconnect_attempt, 1);
+                assert!(state.session_end.is_none());
+                assert!(state.interface.is_none());
+                assert!(state.address.is_none());
+                assert_eq!(state.logs.front().unwrap(), "previous session event");
+                assert!(state.logs.back().unwrap().contains("3 秒后自动重连"));
+                assert!(!state.logs.iter().any(|line| line.contains("test-password")));
+            }
+            assert!(worker.reconnect.pending());
+            assert!(worker.connection.is_some());
+            // Even if cancellation arrives exactly when the retry becomes due,
+            // no new worker, login, or system network operation may be started.
+            let status = worker.handle(&Request::Disconnect)?;
+            assert_eq!(status.phase, Phase::Disconnected);
+            assert_eq!(status.reconnect_attempt, 0);
+            assert!(worker.connection.is_none());
+            worker.reconnect_if_due(now + Duration::from_secs(300))?;
+            assert!(worker.child.is_none());
+            assert!(!worker.reconnect.pending());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn transient_login_failures_continue_recovery_but_authentication_errors_stop_it() -> Result<()>
+    {
+        let now = Instant::now();
+        let mut worker = connected_worker(SessionEndReason::ConnectionLost);
+        worker.finished(false, now)?;
+        assert!(worker.reconnect.take_due(now + Duration::from_secs(3)));
+        worker.transient_failure.store(true, Ordering::Relaxed);
+        worker.finished(false, now + Duration::from_secs(3))?;
+        assert_eq!(worker.status.lock().unwrap().reconnect_attempt, 2);
+        assert!(worker.connection.is_some());
+        assert!(worker.reconnect.take_due(now + Duration::from_secs(8)));
+        // No transient marker: invalid credentials, changed certificate, or
+        // local configuration errors must erase credentials and stop retrying.
+        worker.finished(false, now + Duration::from_secs(8))?;
+        assert_eq!(worker.status.lock().unwrap().phase, Phase::Failed);
+        assert_eq!(worker.status.lock().unwrap().reconnect_attempt, 0);
+        assert!(worker.connection.is_none());
+        assert!(!worker.reconnect.pending());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_remote_session_ends_erase_relogin_credentials() -> Result<()> {
+        for reason in [
+            SessionEndReason::PrivateKick,
+            SessionEndReason::AdminKick,
+            SessionEndReason::OutsideTimePlan,
+            SessionEndReason::LoggedOut,
+            SessionEndReason::Unknown,
+            SessionEndReason::SessionChanged,
+        ] {
+            let mut worker = connected_worker(reason);
+            worker.finished(false, Instant::now())?;
+            assert_eq!(worker.status.lock().unwrap().phase, Phase::Failed);
+            assert_eq!(worker.status.lock().unwrap().session_end, Some(reason));
+            assert!(worker.connection.is_none());
+            assert!(!worker.reconnect.pending());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reconnect_events_are_consumed_and_success_is_visible_in_logs() {
+        let state = Arc::new(Mutex::new(Status {
+            phase: Phase::Connecting,
+            reconnect_attempt: 2,
+            ..Default::default()
+        }));
+        let transient = Arc::new(AtomicBool::new(false));
+        logs(
+            std::io::Cursor::new(format!("{TRANSIENT_FAILURE_EVENT}\n")),
+            state.clone(),
+            transient.clone(),
+        )
+        .join()
+        .unwrap();
+        assert!(transient.load(Ordering::Relaxed));
+        let mut state = state.lock().unwrap();
+        assert!(state.logs.is_empty());
+        ingest_worker_line(&mut state,
+            "TUN ready: test-tun, IPv4 192.0.2.5, MTU 1400, 2 routes; TCP/UDP/ICMP forwarding enabled".into());
+        assert_eq!(state.phase, Phase::Connected);
+        assert_eq!(state.reconnect_attempt, 0);
+        assert!(state.logs.front().unwrap().contains("自动重连成功"));
+    }
+
     #[test]
     fn escaped_status_is_sent_as_one_complete_frame() -> Result<()> {
         #[derive(Default)]
@@ -1046,9 +1325,13 @@ mod tests {
             phase: Phase::Connecting,
             ..Default::default()
         }));
-        logs(std::io::Cursor::new(events), state.clone())
-            .join()
-            .unwrap();
+        logs(
+            std::io::Cursor::new(events),
+            state.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .join()
+        .unwrap();
         let mut state = state.lock().unwrap();
         assert_eq!(state.resource_catalog.entries.len(), 99);
         assert!(state.logs.is_empty());
@@ -1095,9 +1378,11 @@ mod tests {
         let fields = value.as_object_mut().unwrap();
         fields.remove("resource_catalog");
         fields.remove("session_end");
+        fields.remove("reconnect_attempt");
         let status: Status = serde_json::from_value(value).unwrap();
         assert!(status.resource_catalog.entries.is_empty());
         assert!(status.session_end.is_none());
+        assert_eq!(status.reconnect_attempt, 0);
     }
 
     #[test]

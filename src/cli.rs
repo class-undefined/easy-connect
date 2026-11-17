@@ -590,6 +590,63 @@ impl std::fmt::Display for SessionEnded {
 }
 impl std::error::Error for SessionEnded {}
 
+fn transient_connect_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(error) = cause.downcast_ref::<std::io::Error>() {
+            return matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::NetworkUnreachable
+                    | io::ErrorKind::HostUnreachable
+                    | io::ErrorKind::BrokenPipe
+            );
+        }
+        let Some(error) = cause.downcast_ref::<ec_compat::Error>() else {
+            return false;
+        };
+        // ec-compat exposes reviewed, fixed transport summaries here. Match
+        // whole messages; authentication errors or gateway text must not turn
+        // a rejected password or changed certificate into a login loop.
+        for stage in [
+            "discovery",
+            "password_config",
+            "password_login",
+            "session_config",
+            "resource_list",
+        ] {
+            for kind in [
+                "timeout",
+                "connect_or_tls",
+                "protocol_or_io",
+                "response_body",
+                "transport",
+            ] {
+                if error.0 == format!("gateway {stage} request failed ({kind})") {
+                    return true;
+                }
+            }
+            if error.0 == format!("gateway {stage} response read failed") {
+                return true;
+            }
+            if let Some(code) = error
+                .0
+                .strip_prefix(&format!("gateway {stage} returned HTTP "))
+                && code.len() == 3
+                && code
+                    .parse::<u16>()
+                    .is_ok_and(|code| code == 408 || code == 429 || (500..600).contains(&code))
+            {
+                return true;
+            }
+        }
+        false
+    })
+}
+
 fn connection_cancelled() -> bool {
     crate::service::STOP.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -852,7 +909,14 @@ pub async fn run() -> Result<()> {
             if brokered {
                 return connect_brokered(config, username, password).await;
             }
-            connect(config, username, password, listen, mode).await
+            let result = connect(config, username, password, listen, mode).await;
+            if crate::service::CONTROLLED.load(std::sync::atomic::Ordering::Relaxed)
+                && !connection_cancelled()
+                && result.as_ref().is_err_and(transient_connect_error)
+            {
+                eprintln!("{}", crate::service::TRANSIENT_FAILURE_EVENT);
+            }
+            result
         }
     }
 }
@@ -913,6 +977,43 @@ async fn connect_brokered(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retryable_connection_errors_exclude_credentials_trust_and_configuration() {
+        for message in [
+            "gateway discovery request failed (timeout)",
+            "gateway password_login request failed (connect_or_tls)",
+            "gateway resource_list response read failed",
+            "gateway session_config returned HTTP 503",
+            "gateway password_config returned HTTP 429",
+        ] {
+            assert!(
+                transient_connect_error(&ec_compat::Error(message.into()).into()),
+                "{message}"
+            );
+        }
+        for message in [
+            "gateway authentication failed (error_code=2, state=Rejected)",
+            "网关证书已变化，连接已停止；请联系管理员核实",
+            "gateway supplied no L3 configuration",
+            "gateway password_login returned HTTP 401",
+            "gateway password_login returned HTTP 403",
+            "gateway discovery request failed (timeout) private-data",
+            "gateway discovery returned HTTP 503 private-data",
+            "TLS record MAC verification failed",
+        ] {
+            assert!(
+                !transient_connect_error(&ec_compat::Error(message.into()).into()),
+                "{message}"
+            );
+        }
+        let timeout =
+            anyhow::Error::new(io::Error::from(io::ErrorKind::TimedOut)).context("connect");
+        assert!(transient_connect_error(&timeout));
+        assert!(!transient_connect_error(
+            &io::Error::from(io::ErrorKind::PermissionDenied).into()
+        ));
+    }
 
     #[test]
     fn session_status_error_logs_preserve_only_reviewed_diagnostics() {

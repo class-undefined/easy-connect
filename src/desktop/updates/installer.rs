@@ -168,9 +168,10 @@ pub(super) fn prepare_macos(
     let incoming = parent.join(format!(".easy-connect-{unique}.app"));
     let backup = parent.join(format!(".easy-connect-{unique}-previous.app"));
     let mut plan = format!(
-        "parent_pid={}\nversion={}\n",
+        "parent_pid={}\nversion={}\nowner={}\n",
         std::process::id(),
-        shell_quote(version)
+        shell_quote(version),
+        shell_quote(&crate::service::current_owner()?)
     );
     for (key, value) in [
         ("staged", staged),
@@ -482,7 +483,7 @@ mod tests {
         let create = fixture.0.join("create.ps1");
         fs::write(
             &create,
-            "param([string]$Archive,[string]$Entry)\n$ErrorActionPreference='Stop'\nAdd-Type -AssemblyName System.IO.Compression.FileSystem\n$zip=[System.IO.Compression.ZipFile]::Open($Archive,[System.IO.Compression.ZipArchiveMode]::Create)\ntry { $stream=$zip.CreateEntry($Entry).Open(); try { $bytes=[System.Text.Encoding]::UTF8.GetBytes('fixture'); $stream.Write($bytes,0,$bytes.Length) } finally { $stream.Dispose() } } finally { $zip.Dispose() }\n",
+            "param([string]$Archive,[string]$Entry)\n$ErrorActionPreference='Stop'\nAdd-Type -AssemblyName System.IO.Compression\nAdd-Type -AssemblyName System.IO.Compression.FileSystem\n$zip=[System.IO.Compression.ZipFile]::Open($Archive,[System.IO.Compression.ZipArchiveMode]::Create)\ntry { $stream=$zip.CreateEntry($Entry).Open(); try { $bytes=[System.Text.Encoding]::UTF8.GetBytes('fixture'); $stream.Write($bytes,0,$bytes.Length) } finally { $stream.Dispose() } } finally { $zip.Dispose() }\n",
         )?;
         let unpack = fixture.0.join("unpack.ps1");
         fs::write(&unpack, include_str!("windows-unpack.ps1"))?;
