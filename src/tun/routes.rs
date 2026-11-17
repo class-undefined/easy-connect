@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, bail};
-use std::{collections::BTreeSet, net::Ipv4Addr, process::Command, sync::Mutex};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::process::Command;
+use std::{collections::BTreeSet, net::Ipv4Addr, sync::Mutex};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Cidr {
@@ -229,7 +231,7 @@ impl RouteCommands for SystemRoutes {
     fn change(&self, add: bool, cidr: Cidr, interface: &str) -> Result<()> {
         let prefix = format!("prefix={}", cidr.text());
         let alias = format!("interface={interface}");
-        let mut command = Command::new("netsh.exe");
+        let mut command = crate::windows::command("netsh.exe");
         command.args([
             "interface",
             "ipv4",
@@ -253,7 +255,9 @@ impl RouteCommands for SystemRoutes {
     }
     #[cfg(target_os = "windows")]
     fn snapshot(&self) -> Result<Option<BTreeSet<(Cidr, String)>>> {
-        let output=Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-Command","[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore | Select-Object DestinationPrefix,InterfaceAlias | ConvertTo-Json -Compress"]).output()?;
+        let output = crate::windows::powershell(
+            "ConvertTo-Json -Compress -InputObject @(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore | Select-Object DestinationPrefix,InterfaceAlias)",
+        )?;
         if !output.status.success() {
             bail!("cannot inspect Windows route table");
         }
@@ -431,9 +435,7 @@ pub fn physical_gateway(peer: Ipv4Addr) -> Result<Option<Ipv4Addr>> {
         let script = format!(
             "Find-NetRoute -RemoteIPAddress '{peer}' | Where-Object {{ $_.NextHop -and $_.NextHop -ne '0.0.0.0' }} | Select-Object -First 1 -ExpandProperty NextHop"
         );
-        let output = Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .output()?;
+        let output = crate::windows::powershell(&script)?;
         if !output.status.success() {
             bail!("cannot inspect Windows VPN outer route");
         }
@@ -497,6 +499,19 @@ pub type SharedRoutes = std::sync::Arc<Mutex<Box<dyn RoutingTable>>>;
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_route_snapshot_reads_existing_routes_without_elevation() -> Result<()> {
+        let table = SystemRoutes
+            .snapshot()?
+            .expect("Windows provides a snapshot");
+        assert!(
+            table
+                .iter()
+                .any(|(cidr, _)| cidr.contains(Ipv4Addr::LOCALHOST))
+        );
+        Ok(())
+    }
     #[test]
     fn parses_linux_routes_and_preserves_interface_ownership() {
         let table = r#"[{"dst":"default","gateway":"192.0.2.1","dev":"eth0"},{"dst":"10.8.0.0/16","dev":"ectun0"},{"dst":"192.0.2.7","dev":"eth0"}]"#;

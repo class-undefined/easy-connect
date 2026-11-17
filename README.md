@@ -122,7 +122,7 @@ Linux 构建使用 `cargo build --locked --release --bin easy-connect`。Actions
 - 路由曾在启动后丢失，已加入核验和恢复；新会话已确认完整自动路由，无需手动添加。
 - macOS 桌面已启动并完成 GPUI/托盘初始化，密码存储与服务安装需用户本机操作。
 - 0.4.6 的取消、资源展示和会话结束逻辑参考已安装的官方 EasyConnect 7.6.7 Web SDK。已用模拟响应验证状态转换；首次升级和真实顶号仍需在测试环境验收。
-- Windows 双架构由原生 GitHub runner 编译；真实 VPN 连通和服务安装仍需 Windows 机器验收。
+- Windows 双架构由原生 GitHub runner 编译；x86_64 已通过静默 SOCKS 检查，并由用户通过桌面测试版确认内网访问恢复。ARM64 仍需实机验收。Windows 路由修复和验证范围见 [连接维护记录](docs/connection-maintenance.md)。
 - Linux x86_64 已在 Ubuntu 24.04 验证 TUN、SNAT、systemd 与 Tailscale 子网共享，并从 macOS 验证实际 TCP/UDP 连通。Linux ARM64 已加入 CI，实体机器验证待完成。
 - 不支持验证码/SSO、旧版四通道自动降级或 IPv6。
 - 示例证书指纹由网络观测取得，仅绑定对应 IP 和端口，尚未管理员独立核对；证书变化会拒绝连接。

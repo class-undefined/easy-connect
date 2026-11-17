@@ -1,13 +1,10 @@
 use anyhow::{Result, bail};
-use std::process::Command;
 
 pub struct SplitDns {
     comment: String,
 }
 fn powershell(script: &str) -> Result<()> {
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .output()?;
+    let output = crate::windows::powershell(script)?;
     if !output.status.success() {
         bail!(
             "Windows split DNS operation failed: {}",

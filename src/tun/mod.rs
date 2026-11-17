@@ -442,6 +442,27 @@ mod tests {
         assert_eq!(internet_checksum(&reply[..20]), 0);
         assert_eq!(internet_checksum(&reply[20..]), 0);
     }
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    #[ignore = "requires administrator privileges and wintun.dll beside the test executable"]
+    async fn windows_tun_does_not_install_a_default_route() -> Result<()> {
+        preflight()?;
+        // Refuse to reuse an adapter belonging to an active connection.
+        let existing = crate::windows::powershell(
+            "@(Get-NetAdapter -IncludeHidden | Where-Object Name -eq 'EasyConnectRust').Count",
+        )?;
+        assert!(existing.status.success());
+        assert_eq!(String::from_utf8(existing.stdout)?.trim(), "0");
+        let device = create_device("198.51.100.2".parse()?, 1400)?;
+        let interface = device.name()?.replace('\'', "''");
+        let routes = crate::windows::powershell(&format!(
+            "@(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore | Where-Object {{ $_.InterfaceAlias -eq '{interface}' -and $_.DestinationPrefix -eq '0.0.0.0/0' }}).Count"
+        ))?;
+        assert!(routes.status.success());
+        assert_eq!(String::from_utf8(routes.stdout)?.trim(), "0");
+        drop(device);
+        Ok(())
+    }
     #[tokio::test]
     async fn icmp_echo_crosses_the_packet_relay_both_ways() {
         let local = "10.1.2.3".parse().unwrap();
@@ -512,9 +533,13 @@ pub async fn run(
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 fn create_device(address: Ipv4Addr, mtu: usize) -> Result<tun_rs::AsyncDevice> {
-    let builder = tun_rs::DeviceBuilder::new()
-        .mtu(mtu as u16)
-        .ipv4(address, 32, Some(address));
+    let builder = tun_rs::DeviceBuilder::new().mtu(mtu as u16);
+    #[cfg(not(target_os = "windows"))]
+    let builder = builder.ipv4(address, 32, Some(address));
+    // tun-rs interprets the destination as a default gateway on Windows, not
+    // a point-to-point peer. Only RouteManager may install our resource routes.
+    #[cfg(target_os = "windows")]
+    let builder = builder.ipv4(address, 32, None);
     #[cfg(target_os = "macos")]
     let builder = builder.with(|b| {
         b.associate_route(false);
@@ -548,7 +573,7 @@ fn ping_once(target: Ipv4Addr) -> std::io::Result<std::process::Output> {
         .args(["-n", "-c", "1", "-W", "2", &target.to_string()])
         .output();
     #[cfg(target_os = "windows")]
-    let result = std::process::Command::new("ping.exe")
+    let result = crate::windows::command("ping.exe")
         .args(["-n", "1", "-w", "2000", &target.to_string()])
         .output();
     result

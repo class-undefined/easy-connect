@@ -8,11 +8,13 @@ use sha2::Sha256;
 use std::net::{TcpListener, TcpStream};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::os::unix::net::{UnixListener as TcpListener, UnixStream as TcpStream};
+#[cfg(not(target_os = "windows"))]
+use std::process::Command;
 use std::{
     collections::VecDeque,
     io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -205,9 +207,7 @@ pub fn current_owner() -> Result<String> {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        let out = Command::new("whoami.exe")
-            .creation_flags(0x08000000)
+        let out = crate::windows::command("whoami.exe")
             .args(["/user", "/fo", "csv", "/nh"])
             .output()?;
         let text = String::from_utf8_lossy(&out.stdout);
@@ -311,11 +311,9 @@ fn connect_broker(owner: &str) -> Result<TcpStream> {
 }
 #[cfg(target_os = "windows")]
 fn connect_broker(_: &str) -> Result<TcpStream> {
-    use std::os::windows::process::CommandExt;
     let socket = TcpStream::connect_timeout(&([127, 0, 0, 1], PORT).into(), Duration::from_secs(2))
         .context("background service is not running")?;
-    let status = Command::new("sc.exe")
-        .creation_flags(0x08000000)
+    let status = crate::windows::command("sc.exe")
         .args(["queryex", NAME])
         .output()?;
     let text = String::from_utf8_lossy(&status.stdout);
@@ -329,8 +327,7 @@ fn connect_broker(_: &str) -> Result<TcpStream> {
         })
         .filter(|p| *p != 0)
         .context("broker SCM identity unavailable")?;
-    let table = Command::new("netstat.exe")
-        .creation_flags(0x08000000)
+    let table = crate::windows::command("netstat.exe")
         .args(["-ano", "-p", "tcp"])
         .output()?;
     let endpoint = format!("127.0.0.1:{PORT}");
@@ -492,7 +489,10 @@ impl Worker {
                     bail!("disconnect the active connection first");
                 }
                 validate_credentials(gateway, username, password, cert_sha256.as_deref())?;
+                #[cfg(not(target_os = "windows"))]
                 let mut command = Command::new(std::env::current_exe()?);
+                #[cfg(target_os = "windows")]
+                let mut command = crate::windows::command(std::env::current_exe()?);
                 command
                     .args([
                         "connect",
@@ -508,11 +508,6 @@ impl Worker {
                     .stderr(Stdio::piped());
                 if let Some(pin) = cert_sha256 {
                     command.args(["--cert-sha256", pin]);
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    use std::os::windows::process::CommandExt;
-                    command.creation_flags(0x08000000);
                 }
                 let mut child = command.spawn()?;
                 let mut input = child.stdin.take().context("worker input missing")?;
@@ -883,7 +878,7 @@ fn install_windows(owner: &str, token: &std::path::Path) -> Result<()> {
     let binary = dir.join("easy-connect.exe");
     std::fs::copy(&source, &binary)?;
     std::fs::copy(source.with_file_name("wintun.dll"), dir.join("wintun.dll"))?;
-    if !Command::new("icacls.exe")
+    if !crate::windows::command("icacls.exe")
         .arg(token)
         .args([
             "/inheritance:r",
@@ -897,14 +892,14 @@ fn install_windows(owner: &str, token: &std::path::Path) -> Result<()> {
     {
         bail!("cannot protect service capability");
     }
-    let exists = Command::new("sc.exe")
+    let exists = crate::windows::command("sc.exe")
         .args(["query", NAME])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()?
         .success();
     let bin = format!("\"{}\" service --owner {owner}", binary.display());
-    if !Command::new("sc.exe")
+    if !crate::windows::command("sc.exe")
         .args([
             if exists { "config" } else { "create" },
             NAME,
@@ -918,7 +913,7 @@ fn install_windows(owner: &str, token: &std::path::Path) -> Result<()> {
     {
         bail!("cannot install Windows service");
     }
-    if !Command::new("sc.exe")
+    if !crate::windows::command("sc.exe")
         .args(["start", NAME])
         .status()?
         .success()
