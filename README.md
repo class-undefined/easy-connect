@@ -8,6 +8,14 @@
 
 这是第三方兼容客户端，并非深信服官方软件。协议引擎和许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
+## 软件截图
+
+以下为 macOS 桌面界面。截图使用虚构账号、示例域名和文档示例 IP，连接状态与资源列表均为演示数据。
+
+| 登录界面 | 连接后的资源界面 |
+|:---:|:---:|
+| <img src="docs/screenshots/login.png" alt="EasyConnect 登录界面，展示示例网关和账号" width="400"> | <img src="docs/screenshots/resources.png" alt="EasyConnect 已连接界面，展示两组示例资源" width="400"> |
+
 ## 下载与桌面使用
 
 从 [Releases](https://github.com/class-undefined/easy-connect/releases) 下载对应平台：
