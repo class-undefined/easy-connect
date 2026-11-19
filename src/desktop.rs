@@ -40,6 +40,7 @@ gpui::actions!(
     easy_connect,
     [
         ShowMain,
+        HideMain,
         ConnectVpn,
         DisconnectVpn,
         ShowLogs,
@@ -53,6 +54,7 @@ gpui::actions!(
 #[derive(Clone, Copy)]
 enum MenuCommand {
     Show,
+    Hide,
     Connect,
     Disconnect,
     Logs,
@@ -181,6 +183,12 @@ fn show_window(window: &Window, visible: bool) {
         }
     }
 }
+fn hide_to_tray(_window: &Window, _cx: &gpui::App) {
+    #[cfg(target_os = "macos")]
+    _cx.hide();
+    #[cfg(target_os = "windows")]
+    show_window(_window, false);
+}
 fn install_service() -> Result<()> {
     let binary = cli_path()?;
     let owner = service::current_owner()?;
@@ -287,6 +295,7 @@ struct Desktop {
     about_item: MenuItem,
     updates_item: MenuItem,
     controller: Controller,
+    last_phase: Option<Phase>,
     tray: TrayIcon,
     show: MenuItem,
     disconnect: MenuItem,
@@ -392,13 +401,8 @@ impl Desktop {
             .with_menu(Box::new(menu))
             .build()?;
         let window_handle = window.window_handle();
-        window.on_window_should_close(cx, |window, _cx| {
-            #[cfg(target_os = "macos")]
-            _cx.hide();
-            #[cfg(target_os = "windows")]
-            show_window(window, false);
-            #[cfg(target_os = "macos")]
-            let _ = window;
+        window.on_window_should_close(cx, |window, cx| {
+            hide_to_tray(window, cx);
             false
         });
         let mut view = Self {
@@ -429,6 +433,7 @@ impl Desktop {
             about_item,
             updates_item,
             controller,
+            last_phase: None,
             tray,
             show,
             disconnect,
@@ -547,6 +552,20 @@ impl Desktop {
                 }
             }
         }
+        let (phase, can_disconnect, reconnecting) = self
+            .controller
+            .live
+            .lock()
+            .map(|s| (s.phase(), s.can_disconnect(), s.reconnecting()))
+            .unwrap_or_default();
+        if let Some(phase) = phase {
+            let connected = phase == Phase::Connected && self.last_phase != Some(Phase::Connected);
+            self.last_phase = Some(phase);
+            if connected {
+                hide_to_tray(window, cx);
+            }
+        }
+
         let commands = self
             .commands
             .lock()
@@ -562,12 +581,6 @@ impl Desktop {
             let _ = logs.update(cx, |_, _, cx| cx.refresh_windows());
         }
 
-        let (phase, can_disconnect, reconnecting) = self
-            .controller
-            .live
-            .lock()
-            .map(|s| (s.phase(), s.can_disconnect(), s.reconnecting()))
-            .unwrap_or_default();
         let _ = self.tray.set_icon(Some(
             tray_icon(phase == Some(Phase::Connected))
                 .unwrap_or_else(|_| self.tray_icon_fallback()),
@@ -636,6 +649,9 @@ impl Desktop {
             }
             Ok(())
         });
+        if accepted {
+            self.last_phase = Some(Phase::Connecting);
+        }
         self.password.update(cx, |s, cx| {
             if accepted && !self.remember {
                 s.set_value("", window, cx);
@@ -700,6 +716,7 @@ fn install_menus(queue: Arc<Mutex<Vec<MenuCommand>>>, cx: &mut gpui::App) {
         }};
     }
     register!(ShowMain, MenuCommand::Show);
+    register!(HideMain, MenuCommand::Hide);
     register!(ShowAbout, MenuCommand::About);
     register!(ShowPassword, MenuCommand::Password);
     register!(ConnectVpn, MenuCommand::Connect);
@@ -708,6 +725,8 @@ fn install_menus(queue: Arc<Mutex<Vec<MenuCommand>>>, cx: &mut gpui::App) {
     register!(CheckUpdates, MenuCommand::Updates);
     register!(QuitApp, MenuCommand::Quit);
     cx.bind_keys([gpui::KeyBinding::new("secondary-q", QuitApp, None)]);
+    #[cfg(target_os = "macos")]
+    cx.bind_keys([gpui::KeyBinding::new("cmd-w", HideMain, None)]);
     #[cfg(target_os = "macos")]
     cx.set_menus(vec![
         gpui::Menu {
@@ -744,6 +763,8 @@ fn install_menus(queue: Arc<Mutex<Vec<MenuCommand>>>, cx: &mut gpui::App) {
         gpui::Menu {
             name: "窗口".into(),
             items: vec![
+                gpui::MenuItem::action("隐藏到菜单栏", HideMain),
+                gpui::MenuItem::separator(),
                 gpui::MenuItem::action("主窗口", ShowMain),
                 gpui::MenuItem::action("事件日志", ShowLogs),
             ],
@@ -847,6 +868,7 @@ impl Desktop {
                 show_window(window, true);
                 window.activate_window();
             }
+            MenuCommand::Hide => hide_to_tray(window, cx),
             MenuCommand::Connect => self.connect(window, cx),
             MenuCommand::Disconnect => {
                 self.startup_pending = false;
@@ -972,6 +994,8 @@ impl Render for LogView {
         div()
             .id("event-log")
             .size_full()
+            .flex()
+            .flex_col()
             .bg(rgb(0x10161e))
             .text_color(rgb(0xdce6ee))
             .p(px(12.))
@@ -979,13 +1003,14 @@ impl Render for LogView {
             .font_family(if cfg!(windows) { "Consolas" } else { "Menlo" })
             .text_size(px(12.))
             .child(
-                // TextView reports the viewport's height. Its own virtual list
-                // must scroll; an outer div cannot see the document's overflow.
+                // The nested virtual list needs a definite viewport height;
+                // percentage heights can expand with the log instead of scrolling.
                 TextView::html("log-text", log_html(&logs), window, cx)
                     .scrollable(true)
                     .selectable(true)
                     .style(TextViewStyle::default().paragraph_gap(gpui::rems(0.3)))
-                    .size_full()
+                    .w_full()
+                    .h((window.viewport_size().height - px(24.)).max(px(0.)))
                     .min_h_0(),
             )
     }
