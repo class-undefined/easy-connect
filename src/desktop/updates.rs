@@ -173,6 +173,9 @@ fn newer(release: Release, current: &str) -> Result<UpdateState> {
 }
 
 fn client(timeout: Duration) -> Result<reqwest::Client> {
+    // Keep reqwest's automatic proxy detection enabled. Desktop builds include
+    // system-proxy and SOCKS support; rebuild this client for each update check
+    // or download so changes to the OS proxy settings take effect immediately.
     Ok(reqwest::Client::builder()
         .https_only(true)
         .timeout(timeout)
@@ -406,6 +409,8 @@ pub(super) fn install_if_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod proxy;
+
     fn release(tag: &str) -> Release {
         let version = tag.trim_start_matches('v');
         Release {

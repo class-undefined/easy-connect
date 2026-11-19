@@ -1,6 +1,6 @@
 [package]
 name = "easy-connect"
-version = "0.4.19"
+version = "0.4.20"
 authors = ["野漫横江 (class-undefined)"]
 edition = "2024"
 rust-version = "1.94"
@@ -9,7 +9,7 @@ default-run = "easy-connect"
 
 [features]
 default = []
-desktop = ["dep:gpui", "dep:gpui-component", "dep:tray-icon", "dep:keyring", "dep:dirs", "dep:raw-window-handle", "dep:semver"]
+desktop = ["dep:gpui", "dep:gpui-component", "dep:tray-icon", "dep:keyring", "dep:dirs", "dep:raw-window-handle", "dep:semver", "reqwest/system-proxy", "reqwest/socks"]
 
 [[bin]]
 name = "easy-connect-gui"
